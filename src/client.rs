@@ -14,7 +14,7 @@ use tracing::{debug, error, info, trace};
 use zbus::message::Message;
 use zbus::zvariant::serialized;
 
-use crate::auth::SaslAuth;
+use crate::auth::{AuthResult, SaslAuth};
 use crate::error::{ClientError, Result};
 use crate::message::{ErrorBuilder, MessageExt, MethodReturnBuilder};
 use crate::routing::Route;
@@ -112,6 +112,10 @@ pub struct ClientHandler {
     rx: mpsc::Receiver<Arc<Message>>,
     /// Buffer for reading messages.
     read_buf: Vec<u8>,
+    /// Data buffered during authentication that needs to be processed first.
+    pending_data: Vec<u8>,
+    /// Current position in pending_data.
+    pending_pos: usize,
 }
 
 impl ClientHandler {
@@ -123,8 +127,8 @@ impl ClientHandler {
         info!(client_id = id, "New client connection");
 
         // Perform SASL authentication
-        let uid = auth.authenticate_server(&mut stream).await?;
-        debug!(client_id = id, uid = uid, "Client authenticated");
+        let AuthResult { uid, buffered_data } = auth.authenticate_server(&mut stream).await?;
+        debug!(client_id = id, uid = uid, buffered_bytes = buffered_data.len(), "Client authenticated");
 
         // Generate unique name
         let unique_name = format!(":mux.{}", id);
@@ -145,7 +149,64 @@ impl ClientHandler {
             stream,
             rx,
             read_buf: vec![0u8; 16384],
+            pending_data: buffered_data,
+            pending_pos: 0,
         })
+    }
+
+    /// Read exactly `len` bytes into read_buf starting at `offset`, 
+    /// first from pending data, then from stream.
+    async fn read_exact_into_buf(&mut self, offset: usize, len: usize) -> std::io::Result<()> {
+        let mut filled = 0;
+        
+        // First, consume any pending data from auth buffering
+        if self.pending_pos < self.pending_data.len() {
+            let pending_remaining = &self.pending_data[self.pending_pos..];
+            let to_copy = std::cmp::min(pending_remaining.len(), len);
+            self.read_buf[offset..offset + to_copy].copy_from_slice(&pending_remaining[..to_copy]);
+            self.pending_pos += to_copy;
+            filled = to_copy;
+            
+            // If we've consumed all pending data, clear it to free memory
+            if self.pending_pos >= self.pending_data.len() {
+                self.pending_data.clear();
+                self.pending_pos = 0;
+            }
+        }
+        
+        // Read the rest from the stream if needed
+        if filled < len {
+            self.stream.read_exact(&mut self.read_buf[offset + filled..offset + len]).await?;
+        }
+        
+        Ok(())
+    }
+
+    /// Read exactly `buf.len()` bytes, first from pending data, then from stream.
+    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut filled = 0;
+        
+        // First, consume any pending data from auth buffering
+        if self.pending_pos < self.pending_data.len() {
+            let pending_remaining = &self.pending_data[self.pending_pos..];
+            let to_copy = std::cmp::min(pending_remaining.len(), buf.len());
+            buf[..to_copy].copy_from_slice(&pending_remaining[..to_copy]);
+            self.pending_pos += to_copy;
+            filled = to_copy;
+            
+            // If we've consumed all pending data, clear it to free memory
+            if self.pending_pos >= self.pending_data.len() {
+                self.pending_data.clear();
+                self.pending_pos = 0;
+            }
+        }
+        
+        // Read the rest from the stream if needed
+        if filled < buf.len() {
+            self.stream.read_exact(&mut buf[filled..]).await?;
+        }
+        
+        Ok(())
     }
 
     /// Get a reference to the client connection.
@@ -225,13 +286,12 @@ impl ClientHandler {
         // We need to read the header first to know the full message size
         
         let mut header = [0u8; 16];
-        match self.stream.read_exact(&mut header).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        if let Err(e) = self.read_exact(&mut header).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 debug!(client_id = self.client.id, "Client disconnected");
                 return Ok(None);
             }
-            Err(e) => return Err(e.into()),
+            return Err(e.into());
         }
 
         // Parse header to get message length
@@ -267,7 +327,7 @@ impl ClientHandler {
         
         let remaining = (total_size - 16) as usize;
         if remaining > 0 {
-            self.stream.read_exact(&mut self.read_buf[16..16 + remaining]).await?;
+            self.read_exact_into_buf(16, remaining).await?;
         }
 
         // Parse the message

@@ -13,6 +13,14 @@ use uuid::Uuid;
 
 use crate::error::{AuthError, Result};
 
+/// Result of successful authentication.
+pub struct AuthResult {
+    /// The authenticated UID.
+    pub uid: u32,
+    /// Any data that was buffered during auth but belongs to the D-Bus message stream.
+    pub buffered_data: Vec<u8>,
+}
+
 /// SASL authentication handler for D-Bus connections.
 pub struct SaslAuth {
     /// The GUID for this server instance.
@@ -49,8 +57,8 @@ impl SaslAuth {
     /// * `stream` - The Unix stream to authenticate.
     ///
     /// # Returns
-    /// The authenticated UID on success.
-    pub async fn authenticate_server(&self, stream: &mut UnixStream) -> Result<u32> {
+    /// The authenticated UID and any buffered data on success.
+    pub async fn authenticate_server(&self, stream: &mut UnixStream) -> Result<AuthResult> {
         // Read the null byte that starts D-Bus auth
         let mut null_byte = [0u8; 1];
         stream.read_exact(&mut null_byte).await?;
@@ -130,7 +138,7 @@ impl SaslAuth {
     }
 
     /// Complete EXTERNAL auth after UID has been determined.
-    async fn complete_auth<R>(&self, reader: &mut BufReader<R>, uid: u32) -> Result<u32>
+    async fn complete_auth<R>(&self, reader: &mut BufReader<R>, uid: u32) -> Result<AuthResult>
     where
         R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -162,7 +170,14 @@ impl SaslAuth {
         }
 
         debug!(uid = uid, "Authentication successful");
-        Ok(uid)
+        
+        // Extract any remaining buffered data - this is critical!
+        // The client may have sent D-Bus messages immediately after BEGIN,
+        // and BufReader may have read them into its internal buffer.
+        let buffered_data = reader.buffer().to_vec();
+        trace!(buffered_bytes = buffered_data.len(), "Returning buffered data from auth");
+        
+        Ok(AuthResult { uid, buffered_data })
     }
 }
 
