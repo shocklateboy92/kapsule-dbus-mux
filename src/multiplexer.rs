@@ -217,6 +217,7 @@ impl Multiplexer {
         let client_msg_tx = self.client_msg_tx.clone();
         let clients = self.clients.clone();
         let routing_table = self.routing_table.clone();
+        let container_conn = self.container_conn.clone();
 
         tokio::spawn(async move {
             match ClientHandler::accept(stream, &auth).await {
@@ -255,10 +256,32 @@ impl Multiplexer {
                         }
                     }
 
-                    // Release any names owned by this client
+                    // Release any names owned by this client from both
+                    // the routing table and the container bus
                     for name in owned_names {
-                        let mut table = routing_table.write().await;
-                        table.on_container_name_change(&name, &unique_name, "");
+                        // Update routing table
+                        {
+                            let mut table = routing_table.write().await;
+                            table.on_container_name_change(&name, &unique_name, "");
+                        }
+
+                        // Release from container bus daemon
+                        if let Err(e) = container_conn.connection()
+                            .call_method(
+                                Some("org.freedesktop.DBus"),
+                                "/org/freedesktop/DBus",
+                                Some("org.freedesktop.DBus"),
+                                "ReleaseName",
+                                &(&name,),
+                            )
+                            .await
+                        {
+                            warn!(client_id = client_id, name = %name, error = %e, 
+                                  "Failed to release name on client disconnect");
+                        } else {
+                            debug!(client_id = client_id, name = %name, 
+                                   "Released name on client disconnect");
+                        }
                     }
 
                     info!(client_id = client_id, "Client disconnected");

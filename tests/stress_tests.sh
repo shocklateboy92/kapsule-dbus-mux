@@ -374,7 +374,7 @@ test_stress_interleaved_requests() {
 test_stress_name_ownership_race() {
     # Two processes compete for same name simultaneously
     # Tests RoutingTable synchronization
-    local test_name="com.kapsule.stress.RaceTest.$$"
+    local test_name="com.kapsule.stress.RaceTest.P$$"
     local pids=()
     
     for i in $(seq 1 5); do
@@ -402,7 +402,7 @@ test_stress_rapid_name_churn() {
     local success=0
     
     for i in $(seq 1 $NAME_CHURN_COUNT); do
-        local name="com.kapsule.stress.Churn${i}.$$"
+        local name="com.kapsule.stress.Churn${i}.P$$"
         if busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
             org.freedesktop.DBus RequestName su "$name" 0 &>/dev/null; then
             busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
@@ -417,7 +417,7 @@ test_stress_rapid_name_churn() {
 test_stress_name_queue() {
     # Multiple clients queue for same name
     # Based on: D-Bus spec queued owners
-    local test_name="com.kapsule.stress.Queue.$$"
+    local test_name="com.kapsule.stress.Queue.P$$"
     local pids=()
     
     # First owner (no replacement allowed)
@@ -459,7 +459,7 @@ test_stress_name_queue() {
 test_stress_signal_subscription_flood() {
     # Add many match rules then trigger signals
     # Tests match rule evaluation performance
-    local test_name="com.kapsule.stress.Signal.$$"
+    local test_name="com.kapsule.stress.Signal.P$$"
     
     # Request a name so we can send signals
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
@@ -483,7 +483,7 @@ test_stress_name_change_signals() {
     # Trigger many NameOwnerChanged signals
     # Tests signal broadcast under load
     for i in $(seq 1 $SIGNAL_FLOOD_COUNT); do
-        local name="com.kapsule.stress.SignalTest${i}.$$"
+        local name="com.kapsule.stress.SignalTest${i}.P$$"
         busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
             org.freedesktop.DBus RequestName su "$name" 0 &>/dev/null
         busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
@@ -538,7 +538,7 @@ test_stress_invalid_destinations() {
     # Call non-existent services repeatedly
     # Tests error path performance
     for i in $(seq 1 20); do
-        busctl --user call "com.nonexistent.Service${i}.$$" /SomePath \
+        busctl --user call "com.nonexistent.Service${i}.P$$" /SomePath \
             some.Interface SomeMethod 2>&1 || true
     done
     
@@ -613,7 +613,7 @@ test_stress_mixed_operations() {
                     org.freedesktop.DBus ListNames &>/dev/null || true
                 ;;
             3)
-                local name="com.kapsule.stress.Mixed${op}.$$"
+                local name="com.kapsule.stress.Mixed${op}.P$$"
                 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
                     org.freedesktop.DBus RequestName su "$name" 0 &>/dev/null || true
                 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
@@ -638,34 +638,27 @@ test_stress_mixed_operations() {
 # ============================================================================
 
 test_stress_all_driver_methods() {
-    # Exercise all driver methods in sequence
-    local test_name="com.kapsule.stress.AllMethods.$$"
+    # Exercise all driver methods - each busctl is a separate connection,
+    # so we test methods that don't depend on prior state or use
+    # org.freedesktop.DBus which is always available.
     
     # Hello is implicit in connection
     
-    # RequestName
-    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
-        org.freedesktop.DBus RequestName su "$test_name" 0 &>/dev/null || return 1
-    
-    # NameHasOwner
-    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
-        org.freedesktop.DBus NameHasOwner s "$test_name" &>/dev/null || return 1
-    
-    # GetNameOwner
-    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
-        org.freedesktop.DBus GetNameOwner s "$test_name" &>/dev/null || return 1
-    
-    # ListNames
+    # ListNames - works without prior state
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
         org.freedesktop.DBus ListNames &>/dev/null || return 1
     
-    # ListActivatableNames
+    # ListActivatableNames - works without prior state  
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
         org.freedesktop.DBus ListActivatableNames &>/dev/null || return 1
     
-    # ListQueuedOwners
+    # NameHasOwner - test with org.freedesktop.DBus which always exists
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
-        org.freedesktop.DBus ListQueuedOwners s "$test_name" &>/dev/null || return 1
+        org.freedesktop.DBus NameHasOwner s "org.freedesktop.DBus" &>/dev/null || return 1
+    
+    # GetNameOwner - test with org.freedesktop.DBus which always exists
+    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus GetNameOwner s "org.freedesktop.DBus" &>/dev/null || return 1
     
     # GetConnectionUnixUser
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
@@ -683,17 +676,19 @@ test_stress_all_driver_methods() {
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
         org.freedesktop.DBus.Peer GetMachineId &>/dev/null || return 1
     
-    # AddMatch
+    # Test RequestName + ReleaseName in one connection isn't possible with busctl,
+    # but we can test that RequestName succeeds (name released on disconnect)
+    local test_name="com.kapsule.stress.AllMethods.P$$"
+    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus RequestName su "$test_name" 0 &>/dev/null || return 1
+    
+    # AddMatch (connection closes, match is removed automatically)
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
         org.freedesktop.DBus AddMatch s "type='signal'" &>/dev/null || return 1
     
-    # RemoveMatch
+    # ListQueuedOwners with org.freedesktop.DBus (always exists)
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
-        org.freedesktop.DBus RemoveMatch s "type='signal'" &>/dev/null || return 1
-    
-    # ReleaseName
-    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
-        org.freedesktop.DBus ReleaseName s "$test_name" &>/dev/null || return 1
+        org.freedesktop.DBus ListQueuedOwners s "org.freedesktop.DBus" &>/dev/null || return 1
     
     return 0
 }
@@ -710,7 +705,7 @@ test_stress_max_names_per_client() {
     local success=0
     
     for i in $(seq 1 100); do
-        local name="com.kapsule.stress.MaxNames${i}.$$"
+        local name="com.kapsule.stress.MaxNames${i}.P$$"
         if busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
             org.freedesktop.DBus RequestName su "$name" 0 &>/dev/null; then
             names+=("$name")
