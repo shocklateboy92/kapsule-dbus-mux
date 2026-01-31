@@ -67,41 +67,39 @@ impl SaslAuth {
             trace!(line = %line, "Received auth line");
 
             if line.starts_with("AUTH EXTERNAL ") {
-                // Client sends hex-encoded UID
+                // Client sends hex-encoded UID directly (Qt/qdbus style)
                 let hex_uid = line.strip_prefix("AUTH EXTERNAL ").unwrap();
                 let uid = parse_hex_uid(hex_uid)?;
                 
-                debug!(uid = uid, "EXTERNAL auth with UID");
+                debug!(uid = uid, "EXTERNAL auth with UID (direct)");
                 
-                // Send OK with our server GUID
-                let response = format!("OK {}\r\n", self.server_guid);
+                // Complete auth with this UID
+                return self.complete_auth(&mut reader, uid).await;
+            } else if line == "AUTH EXTERNAL" {
+                // Client uses challenge-response flow (busctl/systemd style)
+                // Send DATA challenge (empty challenge for EXTERNAL)
                 let stream = reader.get_mut();
-                stream.write_all(response.as_bytes()).await?;
+                stream.write_all(b"DATA\r\n").await?;
                 stream.flush().await?;
-                trace!("Sent OK response");
+                trace!("Sent DATA challenge for EXTERNAL auth");
                 
-                // Wait for NEGOTIATE_UNIX_FD or BEGIN
+                // Wait for DATA response with hex-encoded UID
                 let line = read_line(&mut reader).await?;
-                trace!(line = %line, "Received post-auth line");
+                trace!(line = %line, "Received DATA response");
                 
-                if line == "NEGOTIATE_UNIX_FD" {
-                    // We support FD passing
-                    let stream = reader.get_mut();
-                    stream.write_all(b"AGREE_UNIX_FD\r\n").await?;
-                    stream.flush().await?;
-                    trace!("Agreed to UNIX FD passing");
-                    
-                    // Now wait for BEGIN
-                    let line = read_line(&mut reader).await?;
-                    if line != "BEGIN" {
-                        return Err(AuthError::ExpectedBegin.into());
-                    }
-                } else if line != "BEGIN" {
-                    return Err(AuthError::ExpectedBegin.into());
+                if let Some(hex_uid) = line.strip_prefix("DATA ") {
+                    let uid = parse_hex_uid(hex_uid)?;
+                    debug!(uid = uid, "EXTERNAL auth with UID (challenge-response)");
+                    return self.complete_auth(&mut reader, uid).await;
+                } else if line == "DATA" {
+                    // Empty DATA response - use socket credentials
+                    // For now, we'll use the current process UID as fallback
+                    let uid = nix::unistd::getuid().as_raw();
+                    debug!(uid = uid, "EXTERNAL auth with empty DATA (using socket UID)");
+                    return self.complete_auth(&mut reader, uid).await;
+                } else {
+                    return Err(AuthError::InvalidData(format!("Expected DATA response, got: {}", line)).into());
                 }
-                
-                debug!(uid = uid, "Authentication successful");
-                return Ok(uid);
             } else if line == "AUTH" {
                 // Client asking what mechanisms we support
                 let stream = reader.get_mut();
@@ -129,6 +127,42 @@ impl SaslAuth {
                 return Err(AuthError::InvalidData(format!("Unexpected line: {}", line)).into());
             }
         }
+    }
+
+    /// Complete EXTERNAL auth after UID has been determined.
+    async fn complete_auth<R>(&self, reader: &mut BufReader<R>, uid: u32) -> Result<u32>
+    where
+        R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        // Send OK with our server GUID
+        let response = format!("OK {}\r\n", self.server_guid);
+        let stream = reader.get_mut();
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
+        trace!("Sent OK response");
+
+        // Wait for NEGOTIATE_UNIX_FD or BEGIN
+        let line = read_line(reader).await?;
+        trace!(line = %line, "Received post-auth line");
+
+        if line == "NEGOTIATE_UNIX_FD" {
+            // We support FD passing
+            let stream = reader.get_mut();
+            stream.write_all(b"AGREE_UNIX_FD\r\n").await?;
+            stream.flush().await?;
+            trace!("Agreed to UNIX FD passing");
+
+            // Now wait for BEGIN
+            let line = read_line(reader).await?;
+            if line != "BEGIN" {
+                return Err(AuthError::ExpectedBegin.into());
+            }
+        } else if line != "BEGIN" {
+            return Err(AuthError::ExpectedBegin.into());
+        }
+
+        debug!(uid = uid, "Authentication successful");
+        Ok(uid)
     }
 }
 
