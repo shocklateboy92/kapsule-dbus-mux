@@ -76,25 +76,23 @@ impl MessageRouter {
     ) -> Result<()> {
         let conn = self.connection_for(route);
         let client_serial = msg.serial();
-        let forwarded_serial = conn.next_serial();
 
-        // Record mapping for reply correlation
+        // Forward the message first
+        // Note: zbus will use the serial from the message itself when sending
+        conn.send(msg).await?;
+
+        // Record mapping using the ACTUAL serial from the message (what the bus will see)
+        // When the reply comes back, it will have reply_serial matching this
         self.serial_map.write().await.insert(
             route,
-            forwarded_serial,
+            client_serial,  // Use the actual serial from the message
             client_id,
             client_serial,
         );
 
-        // Forward the message
-        // Note: We need to create a new message with the new serial
-        // For now, we just send the original message - zbus will assign its own serial
-        conn.send(msg).await?;
-
         trace!(
             client_id = client_id,
             client_serial = client_serial,
-            forwarded_serial = forwarded_serial,
             route = %route,
             "Forwarded method call"
         );

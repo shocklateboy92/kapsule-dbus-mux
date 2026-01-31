@@ -317,6 +317,14 @@ impl Multiplexer {
             "GetNameOwner" => self.handle_get_name_owner(client_id, &msg).await,
             "NameHasOwner" => self.handle_name_has_owner(client_id, &msg).await,
             "GetId" => self.handle_get_id(client_id, &msg).await,
+            "Ping" => self.handle_ping(client_id, &msg).await,
+            "GetMachineId" => self.handle_get_machine_id(client_id, &msg).await,
+            "GetConnectionUnixUser" => self.handle_get_connection_unix_user(client_id, &msg).await,
+            "GetConnectionUnixProcessID" => self.handle_get_connection_unix_process_id(client_id, &msg).await,
+            "GetConnectionCredentials" => self.handle_get_connection_credentials(client_id, &msg).await,
+            "ListQueuedOwners" => self.handle_list_queued_owners(client_id, &msg).await,
+            "Introspect" => self.handle_introspect(client_id, &msg).await,
+            "GetAll" => self.handle_get_all(client_id, &msg).await,
             _ => {
                 // Forward unknown methods to the container bus
                 debug!(method = %member, "Forwarding unknown D-Bus method to container");
@@ -575,6 +583,183 @@ impl Multiplexer {
     async fn handle_get_id(&self, client_id: ClientId, msg: &Message) {
         // Return our server GUID
         self.send_reply_to_client(client_id, msg, &self.auth.guid()).await;
+    }
+
+    /// Handle the Ping method (org.freedesktop.DBus.Peer).
+    async fn handle_ping(&self, client_id: ClientId, msg: &Message) {
+        // Ping just returns an empty reply
+        self.send_reply_to_client(client_id, msg, &()).await;
+    }
+
+    /// Handle the GetMachineId method (org.freedesktop.DBus.Peer).
+    async fn handle_get_machine_id(&self, client_id: ClientId, msg: &Message) {
+        // Return the machine ID from /etc/machine-id
+        let machine_id = std::fs::read_to_string("/etc/machine-id")
+            .unwrap_or_else(|_| "00000000000000000000000000000000".to_string())
+            .trim()
+            .to_string();
+        self.send_reply_to_client(client_id, msg, &machine_id).await;
+    }
+
+    /// Handle the GetConnectionUnixUser method.
+    async fn handle_get_connection_unix_user(&self, client_id: ClientId, msg: &Message) {
+        let name: String = match msg.body().deserialize() {
+            Ok(v) => v,
+            Err(e) => {
+                self.send_error_to_client(client_id, msg, error_names::INVALID_ARGS, &format!("Invalid arguments: {}", e)).await;
+                return;
+            }
+        };
+
+        // For org.freedesktop.DBus, return 0 (root)
+        if name == "org.freedesktop.DBus" {
+            self.send_reply_to_client(client_id, msg, &0u32).await;
+            return;
+        }
+
+        // For our clients, return the authenticated UID (our process UID for now)
+        let uid = nix::unistd::getuid().as_raw();
+        self.send_reply_to_client(client_id, msg, &uid).await;
+    }
+
+    /// Handle the GetConnectionUnixProcessID method.
+    async fn handle_get_connection_unix_process_id(&self, client_id: ClientId, msg: &Message) {
+        let name: String = match msg.body().deserialize() {
+            Ok(v) => v,
+            Err(e) => {
+                self.send_error_to_client(client_id, msg, error_names::INVALID_ARGS, &format!("Invalid arguments: {}", e)).await;
+                return;
+            }
+        };
+
+        // For org.freedesktop.DBus, return our PID
+        let pid = std::process::id();
+        self.send_reply_to_client(client_id, msg, &pid).await;
+    }
+
+    /// Handle the GetConnectionCredentials method.
+    async fn handle_get_connection_credentials(&self, client_id: ClientId, msg: &Message) {
+        let name: String = match msg.body().deserialize() {
+            Ok(v) => v,
+            Err(e) => {
+                self.send_error_to_client(client_id, msg, error_names::INVALID_ARGS, &format!("Invalid arguments: {}", e)).await;
+                return;
+            }
+        };
+
+        // Return credentials as a{sv}
+        let uid = nix::unistd::getuid().as_raw();
+        let pid = std::process::id();
+        
+        use std::collections::HashMap;
+        use zbus::zvariant::{OwnedValue, Value};
+        
+        let mut creds: HashMap<String, OwnedValue> = HashMap::new();
+        creds.insert("UnixUserID".to_string(), Value::from(uid).try_into().unwrap());
+        creds.insert("ProcessID".to_string(), Value::from(pid).try_into().unwrap());
+        
+        self.send_reply_to_client(client_id, msg, &creds).await;
+    }
+
+    /// Handle the ListQueuedOwners method.
+    async fn handle_list_queued_owners(&self, client_id: ClientId, msg: &Message) {
+        let name: String = match msg.body().deserialize() {
+            Ok(v) => v,
+            Err(e) => {
+                self.send_error_to_client(client_id, msg, error_names::INVALID_ARGS, &format!("Invalid arguments: {}", e)).await;
+                return;
+            }
+        };
+
+        // For now, just return empty list - we don't track queued owners
+        // The routing table only tracks which bus owns each name, not specific owners
+        let table = self.routing_table.read().await;
+        let owners: Vec<String> = if table.get_name_owner_route(&name).is_some() {
+            // Name exists but we don't track the actual owner string
+            vec![name.clone()]
+        } else {
+            Vec::new()
+        };
+        
+        self.send_reply_to_client(client_id, msg, &owners).await;
+    }
+
+    /// Handle the Introspect method (org.freedesktop.DBus.Introspectable).
+    async fn handle_introspect(&self, client_id: ClientId, msg: &Message) {
+        let introspect_xml = r#"<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+  <interface name="org.freedesktop.DBus">
+    <method name="Hello">
+      <arg direction="out" type="s"/>
+    </method>
+    <method name="RequestName">
+      <arg direction="in" type="s"/>
+      <arg direction="in" type="u"/>
+      <arg direction="out" type="u"/>
+    </method>
+    <method name="ReleaseName">
+      <arg direction="in" type="s"/>
+      <arg direction="out" type="u"/>
+    </method>
+    <method name="ListNames">
+      <arg direction="out" type="as"/>
+    </method>
+    <method name="ListActivatableNames">
+      <arg direction="out" type="as"/>
+    </method>
+    <method name="GetNameOwner">
+      <arg direction="in" type="s"/>
+      <arg direction="out" type="s"/>
+    </method>
+    <method name="NameHasOwner">
+      <arg direction="in" type="s"/>
+      <arg direction="out" type="b"/>
+    </method>
+    <method name="GetId">
+      <arg direction="out" type="s"/>
+    </method>
+    <method name="GetConnectionUnixUser">
+      <arg direction="in" type="s"/>
+      <arg direction="out" type="u"/>
+    </method>
+    <method name="GetConnectionCredentials">
+      <arg direction="in" type="s"/>
+      <arg direction="out" type="a{sv}"/>
+    </method>
+    <method name="ListQueuedOwners">
+      <arg direction="in" type="s"/>
+      <arg direction="out" type="as"/>
+    </method>
+    <signal name="NameOwnerChanged">
+      <arg type="s"/>
+      <arg type="s"/>
+      <arg type="s"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg direction="out" type="s"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg direction="out" type="s"/>
+    </method>
+  </interface>
+</node>"#;
+        self.send_reply_to_client(client_id, msg, &introspect_xml).await;
+    }
+
+    /// Handle the GetAll method (org.freedesktop.DBus.Properties).
+    async fn handle_get_all(&self, client_id: ClientId, msg: &Message) {
+        // For the D-Bus daemon, there are no standard properties, so return empty dict
+        use std::collections::HashMap;
+        use zbus::zvariant::OwnedValue;
+        
+        let props: HashMap<String, OwnedValue> = HashMap::new();
+        self.send_reply_to_client(client_id, msg, &props).await;
     }
 
     /// Handle a message from one of the buses.
