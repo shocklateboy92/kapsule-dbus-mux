@@ -215,4 +215,151 @@ mod tests {
         assert_eq!(gen.next(), 2);
         assert_eq!(gen.next(), 3);
     }
+
+    #[test]
+    fn test_serial_generator_thread_safety() {
+        use std::sync::Arc;
+        use std::thread;
+        
+        let gen = Arc::new(SerialGenerator::new());
+        let mut handles = vec![];
+        
+        // Spawn multiple threads that each generate serials
+        for _ in 0..10 {
+            let gen = Arc::clone(&gen);
+            handles.push(thread::spawn(move || {
+                let mut serials = vec![];
+                for _ in 0..100 {
+                    serials.push(gen.next());
+                }
+                serials
+            }));
+        }
+        
+        // Collect all serials
+        let mut all_serials: Vec<u32> = vec![];
+        for handle in handles {
+            all_serials.extend(handle.join().unwrap());
+        }
+        
+        // All serials should be unique (no collisions)
+        all_serials.sort();
+        let len_before = all_serials.len();
+        all_serials.dedup();
+        assert_eq!(all_serials.len(), len_before, "Serial collision detected!");
+    }
+
+    #[test]
+    fn test_serial_map_multiple_clients_same_serial() {
+        let mut map = SerialMap::new();
+        
+        // Simulate what happens with proper serial translation:
+        // Client 1 sends with client_serial=1, gets forwarded_serial=100
+        // Client 2 sends with client_serial=1, gets forwarded_serial=101
+        map.insert(Route::Host, 100, 1, 1);  // (route, forwarded, client_id, client_serial)
+        map.insert(Route::Host, 101, 2, 1);
+        
+        // Both should be retrievable without collision
+        let call1 = map.remove(Route::Host, 100).unwrap();
+        assert_eq!(call1.client_id, 1);
+        assert_eq!(call1.client_serial, 1);
+        
+        let call2 = map.remove(Route::Host, 101).unwrap();
+        assert_eq!(call2.client_id, 2);
+        assert_eq!(call2.client_serial, 1);
+    }
+
+    #[test]
+    fn test_serial_map_collision_scenario() {
+        // This test demonstrates the OLD bug:
+        // Without serial translation, both clients would use the same key
+        let mut map = SerialMap::new();
+        
+        // OLD BUG: If we used client_serial as forwarded_serial directly,
+        // the second insert would overwrite the first
+        // map.insert(Route::Host, 1, 1, 1);  // Client 1, serial 1
+        // map.insert(Route::Host, 1, 2, 1);  // Client 2, serial 1 - OVERWRITES!
+        
+        // NEW CORRECT: Each gets a unique forwarded serial
+        map.insert(Route::Host, 1001, 1, 1);  // Client 1's serial 1 -> forwarded 1001
+        map.insert(Route::Host, 1002, 2, 1);  // Client 2's serial 1 -> forwarded 1002
+        
+        assert_eq!(map.len(), 2);  // Both are preserved
+    }
+
+    #[test]
+    fn test_pending_for_client() {
+        let mut map = SerialMap::new();
+        
+        // Client 1 has 3 pending calls
+        map.insert(Route::Host, 100, 1, 1);
+        map.insert(Route::Host, 101, 1, 2);
+        map.insert(Route::Host, 102, 1, 3);
+        
+        // Client 2 has 2 pending calls
+        map.insert(Route::Host, 200, 2, 1);
+        map.insert(Route::Container, 201, 2, 2);
+        
+        assert_eq!(map.pending_for_client(1), 3);
+        assert_eq!(map.pending_for_client(2), 2);
+        assert_eq!(map.pending_for_client(999), 0);  // Unknown client
+    }
+
+    #[test]
+    fn test_cleanup_expired() {
+        use std::time::Duration;
+        use std::thread;
+        
+        let mut map = SerialMap::with_timeout(Duration::from_millis(50));
+        
+        map.insert(Route::Host, 100, 1, 5);
+        map.insert(Route::Host, 101, 2, 10);
+        
+        assert_eq!(map.len(), 2);
+        
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(100));
+        
+        let cleaned = map.cleanup_expired();
+        assert_eq!(cleaned, 2);
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_partial() {
+        use std::time::Duration;
+        use std::thread;
+        
+        let mut map = SerialMap::with_timeout(Duration::from_millis(100));
+        
+        // Insert first entry
+        map.insert(Route::Host, 100, 1, 5);
+        
+        // Wait a bit, then insert second entry
+        thread::sleep(Duration::from_millis(60));
+        map.insert(Route::Host, 101, 2, 10);
+        
+        // Wait enough for first to expire but not second
+        thread::sleep(Duration::from_millis(60));
+        
+        let cleaned = map.cleanup_expired();
+        assert_eq!(cleaned, 1);  // Only first entry expired
+        assert_eq!(map.len(), 1);  // Second entry still present
+        
+        // The remaining entry should be client 2
+        let remaining = map.remove(Route::Host, 101).unwrap();
+        assert_eq!(remaining.client_id, 2);
+    }
+
+    #[test]
+    fn test_serial_key_equality() {
+        let key1 = SerialKey::new(Route::Host, 100);
+        let key2 = SerialKey::new(Route::Host, 100);
+        let key3 = SerialKey::new(Route::Container, 100);
+        let key4 = SerialKey::new(Route::Host, 101);
+        
+        assert_eq!(key1, key2);  // Same route and serial
+        assert_ne!(key1, key3);  // Different route
+        assert_ne!(key1, key4);  // Different serial
+    }
 }

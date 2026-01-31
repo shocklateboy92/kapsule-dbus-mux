@@ -17,7 +17,8 @@ use crate::bus_connection::BusConnection;
 use crate::client::ClientHandler;
 use crate::error::Result;
 use crate::message::{
-    parse_name_owner_changed, ErrorBuilder, MessageExt, MethodReturnBuilder, error_names,
+    clone_reply_with_serial, parse_name_owner_changed, ErrorBuilder, MessageExt, 
+    MethodReturnBuilder, error_names,
 };
 use crate::router::MessageRouter;
 use crate::routing::{Route, RoutingTable};
@@ -792,13 +793,24 @@ impl Multiplexer {
 
         // Handle replies
         if msg.is_method_return() || msg.is_error() {
-            if let Ok(Some((client_id, _client_serial))) = self.router.handle_reply(&msg, route).await {
+            if let Ok(Some((client_id, client_serial))) = self.router.handle_reply(&msg, route).await {
+                // Rewrite the reply_serial to match the client's original serial
+                let reply_msg = match clone_reply_with_serial(&msg, client_serial) {
+                    Ok(m) => Arc::new(m),
+                    Err(e) => {
+                        warn!(
+                            client_id = client_id,
+                            error = %e,
+                            "Failed to rewrite reply serial, forwarding original"
+                        );
+                        msg.clone()
+                    }
+                };
+                
                 // Send reply to client
-                // Note: We'd need to rewrite the reply serial to match the client's original
-                // For now, just forward the message
                 let clients = self.clients.read().await;
                 if let Some(info) = clients.get(&client_id) {
-                    if let Err(e) = info.tx.send(msg.clone()).await {
+                    if let Err(e) = info.tx.send(reply_msg).await {
                         warn!(client_id = client_id, error = %e, "Failed to send reply to client");
                     }
                 }

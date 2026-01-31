@@ -11,7 +11,7 @@ use zbus::message::Message;
 
 use crate::bus_connection::BusConnection;
 use crate::error::{MessageError, Result};
-use crate::message::MessageExt;
+use crate::message::{clone_message_with_serial, MessageExt};
 use crate::routing::{Route, RoutingTable};
 use crate::serial_map::{ClientId, SerialMap};
 
@@ -67,7 +67,9 @@ impl MessageRouter {
 
     /// Forward a method call to the appropriate bus.
     ///
-    /// Records the serial mapping for reply correlation.
+    /// Generates a new serial for the upstream bus and records the mapping
+    /// for reply correlation. This prevents serial collisions when multiple
+    /// clients send messages that happen to use the same serial numbers.
     pub async fn forward_method_call(
         &self,
         client_id: ClientId,
@@ -76,16 +78,22 @@ impl MessageRouter {
     ) -> Result<()> {
         let conn = self.connection_for(route);
         let client_serial = msg.serial();
+        
+        // Generate a new unique serial for the upstream bus
+        let forwarded_serial = conn.next_serial();
+        
+        // Clone the message with the new serial
+        let forwarded_msg = clone_message_with_serial(msg, forwarded_serial)?;
 
-        // Forward the message first
-        // Note: zbus will use the serial from the message itself when sending
-        conn.send(msg).await?;
+        // Forward the message with the new serial
+        conn.send(&forwarded_msg).await?;
 
-        // Record mapping using the ACTUAL serial from the message (what the bus will see)
-        // When the reply comes back, it will have reply_serial matching this
+        // Record mapping: (route, forwarded_serial) -> (client_id, client_serial)
+        // When the reply comes back with reply_serial = forwarded_serial,
+        // we can look up the original client and their serial
         self.serial_map.write().await.insert(
             route,
-            client_serial,  // Use the actual serial from the message
+            forwarded_serial,
             client_id,
             client_serial,
         );
@@ -93,8 +101,9 @@ impl MessageRouter {
         trace!(
             client_id = client_id,
             client_serial = client_serial,
+            forwarded_serial = forwarded_serial,
             route = %route,
-            "Forwarded method call"
+            "Forwarded method call with serial translation"
         );
 
         Ok(())
