@@ -8,14 +8,15 @@ D-Bus multiplexer routing between container and host buses. Container names take
 ```
 main.rs          CLI (clap): --listen, --container-bus, --host-bus, --log-level
 lib.rs           Re-exports: Multiplexer, Route, RoutingTable, Error, Result
-multiplexer.rs   Main event loop, D-Bus daemon method handling
+multiplexer.rs   Main event loop, D-Bus daemon method handling, credential lookup
 routing.rs       RoutingTable, Route enum, UniqueNameRegistry
-client.rs        ClientConnection, ClientHandler (per-client task)
+client.rs        ClientConnection, ClientHandler (per-client task), peer credentials
 router.rs        MessageRouter, serial correlation
 bus_connection.rs BusConnection (zbus wrapper)
-auth.rs          SaslAuth (EXTERNAL auth)
+auth.rs          SaslAuth (EXTERNAL auth), AuthResult
 serial_map.rs    SerialMap, PendingCall, ClientId
-message.rs       MessageExt trait, MethodReturnBuilder, ErrorBuilder
+message.rs       MessageExt trait, MethodReturnBuilder, ErrorBuilder, error_names
+match_rules.rs   MatchRule parsing, ClientMatchRules, signal filtering
 error.rs         Error, AuthError, RoutingError, ClientError, MessageError
 ```
 
@@ -27,7 +28,14 @@ enum Route { Container, Host }
 type ClientId = u64;  // from serial_map.rs
 
 // multiplexer.rs
-struct ClientInfo { unique_name: String, tx: mpsc::Sender<Arc<Message>>, owned_names: HashSet<String> }
+struct ClientCredentials { uid: u32, pid: Option<u32>, gid: u32 }
+struct ClientInfo { 
+    unique_name: String, 
+    tx: mpsc::Sender<Arc<Message>>, 
+    owned_names: HashSet<String>,
+    match_rules: ClientMatchRules,
+    credentials: ClientCredentials,
+}
 
 // Client naming: ":mux.{id}" where id is atomic counter
 ```
@@ -76,6 +84,11 @@ else → Host (default)
 | GetNameOwner | Query bus based on routing |
 | NameHasOwner | Check routing table |
 | GetId | Return server GUID |
+| GetConnectionUnixUser | Return client's UID (from peer_cred) |
+| GetConnectionUnixProcessID | Return client's PID (from peer_cred) |
+| GetConnectionCredentials | Return client's UID/PID/GID dict |
+| AddMatch | Register match rule for signal filtering |
+| RemoveMatch | Unregister match rule |
 | Other | Forward to container bus |
 
 ## Message Flow
@@ -123,7 +136,8 @@ async fn forward_method_call(&self, client_id, msg, route) -> Result<()>
 async fn handle_reply(&self, msg, route) -> Result<Option<(ClientId, u32)>>
 
 // SaslAuth
-async fn authenticate_server(&self, stream: &mut UnixStream) -> Result<u32>  // Returns UID
+async fn authenticate_server(&self, stream: &mut UnixStream) -> Result<AuthResult>
+  // AuthResult { uid: u32, buffered_data: Vec<u8> }
 fn guid(&self) -> &str
 
 // MessageExt (trait on Message)
@@ -144,7 +158,8 @@ ErrorBuilder::new(request, error_name).destination(dest).build(msg) -> Result<Me
 ## Error Names (message.rs::error_names)
 
 ```rust
-FAILED, INVALID_ARGS, UNKNOWN_METHOD, NAME_HAS_NO_OWNER, NO_REPLY, etc.
+FAILED, INVALID_ARGS, UNKNOWN_METHOD, NAME_HAS_NO_OWNER, NO_REPLY,
+UNIX_PROCESS_ID_UNKNOWN, MATCH_RULE_NOT_FOUND, MATCH_RULE_INVALID, etc.
 ```
 
 ## Dependencies

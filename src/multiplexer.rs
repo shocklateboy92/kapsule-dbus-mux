@@ -84,6 +84,19 @@ struct ClientInfo {
     owned_names: std::collections::HashSet<String>,
     /// Match rules for signal filtering.
     match_rules: ClientMatchRules,
+    /// Client credentials (UID, PID, GID) obtained from peer_cred.
+    credentials: ClientCredentials,
+}
+
+/// Unix credentials for a connected client.
+#[derive(Debug, Clone, Copy)]
+struct ClientCredentials {
+    /// User ID of the client process.
+    uid: u32,
+    /// Process ID of the client process.
+    pid: Option<u32>,
+    /// Group ID of the client process.
+    gid: u32,
 }
 
 impl Multiplexer {
@@ -227,6 +240,11 @@ impl Multiplexer {
                 Ok(handler) => {
                     let client_id = handler.id();
                     let unique_name = handler.unique_name().to_string();
+                    let credentials = ClientCredentials {
+                        uid: handler.uid(),
+                        pid: handler.pid(),
+                        gid: handler.gid(),
+                    };
 
                     // Create outbound channel for this client
                     let (outbound_tx, outbound_rx) = mpsc::channel(256);
@@ -239,10 +257,12 @@ impl Multiplexer {
                             tx: outbound_tx,
                             owned_names: std::collections::HashSet::new(),
                             match_rules: ClientMatchRules::new(),
+                            credentials,
                         });
                     }
 
-                    info!(client_id = client_id, unique_name = %unique_name, "Client registered");
+                    info!(client_id = client_id, unique_name = %unique_name, 
+                          uid = credentials.uid, pid = ?credentials.pid, "Client registered");
 
                     // Run the client handler
                     if let Err(e) = handler.run(outbound_rx, client_msg_tx).await {
@@ -369,6 +389,33 @@ impl Multiplexer {
                 }
             }
         }
+    }
+
+    /// Find a client's credentials by their bus name.
+    /// 
+    /// The name can be either:
+    /// - A unique name like `:mux.1`
+    /// - A well-known name owned by a client
+    /// 
+    /// Returns None if the name doesn't match any connected client.
+    async fn find_client_credentials(&self, name: &str) -> Option<ClientCredentials> {
+        let clients = self.clients.read().await;
+        
+        // First, check if it's a unique name
+        for info in clients.values() {
+            if info.unique_name == name {
+                return Some(info.credentials);
+            }
+        }
+        
+        // Then, check if it's a well-known name owned by one of our clients
+        for info in clients.values() {
+            if info.owned_names.contains(name) {
+                return Some(info.credentials);
+            }
+        }
+        
+        None
     }
 
     /// Handle the Hello method.
@@ -647,14 +694,23 @@ impl Multiplexer {
             return;
         }
 
-        // For our clients, return the authenticated UID (our process UID for now)
-        let uid = nix::unistd::getuid().as_raw();
-        self.send_reply_to_client(client_id, msg, &uid).await;
+        // Look up the client by name
+        if let Some(creds) = self.find_client_credentials(&name).await {
+            self.send_reply_to_client(client_id, msg, &creds.uid).await;
+        } else {
+            // Name not found among our clients
+            self.send_error_to_client(
+                client_id,
+                msg,
+                error_names::NAME_HAS_NO_OWNER,
+                &format!("Could not get UID of name '{}': no such name", name),
+            ).await;
+        }
     }
 
     /// Handle the GetConnectionUnixProcessID method.
     async fn handle_get_connection_unix_process_id(&self, client_id: ClientId, msg: &Message) {
-        let _name: String = match msg.body().deserialize() {
+        let name: String = match msg.body().deserialize() {
             Ok(v) => v,
             Err(e) => {
                 self.send_error_to_client(client_id, msg, error_names::INVALID_ARGS, &format!("Invalid arguments: {}", e)).await;
@@ -662,14 +718,40 @@ impl Multiplexer {
             }
         };
 
-        // For org.freedesktop.DBus, return our PID
-        let pid = std::process::id();
-        self.send_reply_to_client(client_id, msg, &pid).await;
+        // For org.freedesktop.DBus, return our PID (the multiplexer's PID)
+        if name == "org.freedesktop.DBus" {
+            let pid = std::process::id();
+            self.send_reply_to_client(client_id, msg, &pid).await;
+            return;
+        }
+
+        // Look up the client by name
+        if let Some(creds) = self.find_client_credentials(&name).await {
+            if let Some(pid) = creds.pid {
+                self.send_reply_to_client(client_id, msg, &pid).await;
+            } else {
+                // PID not available (shouldn't happen on Linux, but handle it)
+                self.send_error_to_client(
+                    client_id,
+                    msg,
+                    error_names::UNIX_PROCESS_ID_UNKNOWN,
+                    &format!("Could not get PID of name '{}': not available", name),
+                ).await;
+            }
+        } else {
+            // Name not found among our clients
+            self.send_error_to_client(
+                client_id,
+                msg,
+                error_names::NAME_HAS_NO_OWNER,
+                &format!("Could not get PID of name '{}': no such name", name),
+            ).await;
+        }
     }
 
     /// Handle the GetConnectionCredentials method.
     async fn handle_get_connection_credentials(&self, client_id: ClientId, msg: &Message) {
-        let _name: String = match msg.body().deserialize() {
+        let name: String = match msg.body().deserialize() {
             Ok(v) => v,
             Err(e) => {
                 self.send_error_to_client(client_id, msg, error_names::INVALID_ARGS, &format!("Invalid arguments: {}", e)).await;
@@ -677,20 +759,43 @@ impl Multiplexer {
             }
         };
 
-        // Return credentials as a{sv}
-        // Note: In a full implementation, we'd look up the connection by name
-        // and return its credentials. For now, return our own credentials.
-        let uid = nix::unistd::getuid().as_raw();
-        let pid = std::process::id();
-        
         use std::collections::HashMap;
         use zbus::zvariant::{OwnedValue, Value};
-        
-        let mut creds: HashMap<String, OwnedValue> = HashMap::new();
-        creds.insert("UnixUserID".to_string(), Value::from(uid).try_into().unwrap());
-        creds.insert("ProcessID".to_string(), Value::from(pid).try_into().unwrap());
-        
-        self.send_reply_to_client(client_id, msg, &creds).await;
+
+        // For org.freedesktop.DBus, return our own credentials
+        if name == "org.freedesktop.DBus" {
+            let uid = nix::unistd::getuid().as_raw();
+            let pid = std::process::id();
+            let gid = nix::unistd::getgid().as_raw();
+            
+            let mut creds: HashMap<String, OwnedValue> = HashMap::new();
+            creds.insert("UnixUserID".to_string(), Value::from(uid).try_into().unwrap());
+            creds.insert("ProcessID".to_string(), Value::from(pid).try_into().unwrap());
+            creds.insert("UnixGroupID".to_string(), Value::from(gid).try_into().unwrap());
+            
+            self.send_reply_to_client(client_id, msg, &creds).await;
+            return;
+        }
+
+        // Look up the client by name
+        if let Some(client_creds) = self.find_client_credentials(&name).await {
+            let mut creds: HashMap<String, OwnedValue> = HashMap::new();
+            creds.insert("UnixUserID".to_string(), Value::from(client_creds.uid).try_into().unwrap());
+            if let Some(pid) = client_creds.pid {
+                creds.insert("ProcessID".to_string(), Value::from(pid).try_into().unwrap());
+            }
+            creds.insert("UnixGroupID".to_string(), Value::from(client_creds.gid).try_into().unwrap());
+            
+            self.send_reply_to_client(client_id, msg, &creds).await;
+        } else {
+            // Name not found among our clients
+            self.send_error_to_client(
+                client_id,
+                msg,
+                error_names::NAME_HAS_NO_OWNER,
+                &format!("Could not get credentials of name '{}': no such name", name),
+            ).await;
+        }
     }
 
     /// Handle the ListQueuedOwners method.
@@ -1083,5 +1188,49 @@ impl Drop for Multiplexer {
         if self.listen_path.exists() {
             let _ = std::fs::remove_file(&self.listen_path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test ClientCredentials struct.
+    #[test]
+    fn test_client_credentials_clone() {
+        let creds = ClientCredentials {
+            uid: 1000,
+            pid: Some(12345),
+            gid: 1000,
+        };
+        let cloned = creds;
+        assert_eq!(cloned.uid, 1000);
+        assert_eq!(cloned.pid, Some(12345));
+        assert_eq!(cloned.gid, 1000);
+    }
+
+    #[test]
+    fn test_client_credentials_without_pid() {
+        let creds = ClientCredentials {
+            uid: 1000,
+            pid: None,
+            gid: 1000,
+        };
+        assert_eq!(creds.uid, 1000);
+        assert!(creds.pid.is_none());
+        assert_eq!(creds.gid, 1000);
+    }
+
+    #[test]
+    fn test_client_credentials_debug() {
+        let creds = ClientCredentials {
+            uid: 1000,
+            pid: Some(12345),
+            gid: 1000,
+        };
+        let debug_str = format!("{:?}", creds);
+        assert!(debug_str.contains("uid: 1000"));
+        assert!(debug_str.contains("pid: Some(12345)"));
+        assert!(debug_str.contains("gid: 1000"));
     }
 }

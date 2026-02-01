@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::error::{AuthError, Result};
 
 /// Result of successful authentication.
+#[derive(Debug)]
 pub struct AuthResult {
     /// The authenticated UID.
     pub uid: u32,

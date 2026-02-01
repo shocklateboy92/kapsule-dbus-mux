@@ -304,6 +304,37 @@ test_busctl_get_connection_unix_user() {
     echo "$output" | grep -qE "^u [0-9]+"
 }
 
+test_busctl_get_connection_unix_process_id() {
+    # Test GetConnectionUnixProcessID for org.freedesktop.DBus
+    local output
+    output=$(timeout 5 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus GetConnectionUnixProcessID s "org.freedesktop.DBus" 2>&1)
+    
+    # Should return a uint32 (the PID)
+    echo "$output" | grep -qE "^u [0-9]+"
+}
+
+test_busctl_get_connection_credentials() {
+    # Test GetConnectionCredentials for org.freedesktop.DBus
+    local output
+    output=$(timeout 5 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus GetConnectionCredentials s "org.freedesktop.DBus" 2>&1)
+    
+    # Should return a dict containing at least UnixUserID
+    echo "$output" | grep -q "UnixUserID"
+}
+
+test_busctl_get_connection_unix_user_unknown_name() {
+    # Test GetConnectionUnixUser for a non-existent name
+    # Should return an error with NameHasNoOwner
+    local output
+    output=$(timeout 5 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus GetConnectionUnixUser s ":99.99999" 2>&1) || true
+    
+    # Should get an error containing NameHasNoOwner
+    echo "$output" | grep -qi "NameHasNoOwner\|no such name"
+}
+
 test_busctl_request_name() {
     # Test requesting a name
     local output
@@ -567,6 +598,9 @@ main() {
     run_test "busctl: NameHasOwner" test_busctl_name_has_owner || true
     run_test "busctl: ListQueuedOwners" test_busctl_list_queued_owners || true
     run_test "busctl: GetConnectionUnixUser" test_busctl_get_connection_unix_user || true
+    run_test "busctl: GetConnectionUnixProcessID" test_busctl_get_connection_unix_process_id || true
+    run_test "busctl: GetConnectionCredentials" test_busctl_get_connection_credentials || true
+    run_test "busctl: GetConnectionUnixUser (unknown)" test_busctl_get_connection_unix_user_unknown_name || true
     run_test "busctl: RequestName/ReleaseName" test_busctl_request_name || true
     run_test "busctl: Ping" test_busctl_ping || true
     run_test "busctl: GetMachineId" test_busctl_get_machine_id || true

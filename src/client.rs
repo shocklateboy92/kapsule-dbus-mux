@@ -41,6 +41,10 @@ pub struct ClientConnection {
     tx: mpsc::Sender<Arc<Message>>,
     /// The authenticated UID.
     uid: u32,
+    /// The client's PID (process ID).
+    pid: Option<u32>,
+    /// The client's GID (group ID).
+    gid: u32,
 }
 
 impl ClientConnection {
@@ -57,6 +61,16 @@ impl ClientConnection {
     /// Get the authenticated UID.
     pub fn uid(&self) -> u32 {
         self.uid
+    }
+
+    /// Get the client's PID.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Get the client's GID.
+    pub fn gid(&self) -> u32 {
+        self.gid
     }
 
     /// Get the names owned by this client.
@@ -126,9 +140,22 @@ impl ClientHandler {
         let id = next_client_id();
         info!(client_id = id, "New client connection");
 
+        // Get peer credentials from the socket before authentication
+        // This gives us PID and GID which aren't available through SASL EXTERNAL
+        let (pid, gid) = match stream.peer_cred() {
+            Ok(cred) => (
+                cred.pid().map(|p| p as u32),
+                cred.gid(),
+            ),
+            Err(e) => {
+                debug!(client_id = id, error = %e, "Could not get peer credentials");
+                (None, 0)
+            }
+        };
+
         // Perform SASL authentication
         let AuthResult { uid, buffered_data } = auth.authenticate_server(&mut stream).await?;
-        debug!(client_id = id, uid = uid, buffered_bytes = buffered_data.len(), "Client authenticated");
+        debug!(client_id = id, uid = uid, pid = ?pid, gid = gid, buffered_bytes = buffered_data.len(), "Client authenticated");
 
         // Generate unique name
         let unique_name = format!(":mux.{}", id);
@@ -142,6 +169,8 @@ impl ClientHandler {
             owned_names: HashSet::new(),
             tx,
             uid,
+            pid,
+            gid,
         };
 
         Ok(Self {
@@ -232,6 +261,21 @@ impl ClientHandler {
     /// Get the client's unique name.
     pub fn unique_name(&self) -> &str {
         &self.client.unique_name
+    }
+
+    /// Get the client's UID.
+    pub fn uid(&self) -> u32 {
+        self.client.uid
+    }
+
+    /// Get the client's PID.
+    pub fn pid(&self) -> Option<u32> {
+        self.client.pid
+    }
+
+    /// Get the client's GID.
+    pub fn gid(&self) -> u32 {
+        self.client.gid
     }
 
     /// Create the Hello reply message for this client.

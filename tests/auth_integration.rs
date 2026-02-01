@@ -146,9 +146,9 @@ async fn test_external_auth_success() {
     
     // Verify server completed successfully
     let result = server_handle.await.expect("Server task panicked");
-    let authenticated_uid = result.expect("Authentication should succeed");
+    let auth_result = result.expect("Authentication should succeed");
     
-    assert_eq!(authenticated_uid, uid);
+    assert_eq!(auth_result.uid, uid);
     assert_eq!(received_guid, expected_guid);
 }
 
@@ -168,9 +168,9 @@ async fn test_external_auth_challenge_response() {
     let received_guid = client_auth_external_challenge_response(&mut client_stream, uid, false).await;
     
     let result = server_handle.await.expect("Server task panicked");
-    let authenticated_uid = result.expect("Challenge-response auth should succeed");
+    let auth_result = result.expect("Challenge-response auth should succeed");
     
-    assert_eq!(authenticated_uid, uid);
+    assert_eq!(auth_result.uid, uid);
     assert_eq!(received_guid, expected_guid);
 }
 
@@ -189,9 +189,9 @@ async fn test_external_auth_challenge_response_with_fd() {
     client_auth_external_challenge_response(&mut client_stream, uid, true).await;
     
     let result = server_handle.await.expect("Server task panicked");
-    let authenticated_uid = result.expect("Challenge-response with FD should succeed");
+    let auth_result = result.expect("Challenge-response with FD should succeed");
     
-    assert_eq!(authenticated_uid, uid);
+    assert_eq!(auth_result.uid, uid);
 }
 
 #[tokio::test]
@@ -228,10 +228,10 @@ async fn test_external_auth_empty_data_response() {
     client_stream.flush().await.unwrap();
     
     let result = server_handle.await.expect("Server task panicked");
-    let authenticated_uid = result.expect("Empty DATA auth should succeed");
+    let auth_result = result.expect("Empty DATA auth should succeed");
     
     // Should use the current process UID as fallback
-    assert_eq!(authenticated_uid, nix::unistd::getuid().as_raw());
+    assert_eq!(auth_result.uid, nix::unistd::getuid().as_raw());
 }
 
 #[tokio::test]
@@ -268,9 +268,9 @@ async fn test_external_auth_with_fd_negotiation() {
     client_auth_external(&mut client_stream, uid, true).await;
     
     let result = server_handle.await.expect("Server task panicked");
-    let authenticated_uid = result.expect("Authentication should succeed");
+    let auth_result = result.expect("Authentication should succeed");
     
-    assert_eq!(authenticated_uid, uid);
+    assert_eq!(auth_result.uid, uid);
 }
 
 #[tokio::test]
@@ -288,10 +288,10 @@ async fn test_external_auth_different_uid() {
     client_auth_external(&mut client_stream, claimed_uid, false).await;
     
     let result = server_handle.await.expect("Server task panicked");
-    let authenticated_uid = result.expect("Authentication should succeed");
+    let auth_result = result.expect("Authentication should succeed");
     
     // The auth module accepts any claimed UID (credential check would be done elsewhere)
-    assert_eq!(authenticated_uid, claimed_uid);
+    assert_eq!(auth_result.uid, claimed_uid);
 }
 
 // ============================================================================
@@ -663,9 +663,9 @@ async fn test_various_uid_values() {
         client_auth_external(&mut client_stream, test_uid, false).await;
         
         let result = server_handle.await.expect("Server task panicked");
-        let authenticated_uid = result.expect(&format!("Auth should succeed for UID {}", test_uid));
+        let auth_result = result.expect(&format!("Auth should succeed for UID {}", test_uid));
         
-        assert_eq!(authenticated_uid, test_uid, "UID mismatch for {}", test_uid);
+        assert_eq!(auth_result.uid, test_uid, "UID mismatch for {}", test_uid);
     }
 }
 
@@ -722,8 +722,8 @@ async fn test_multiple_concurrent_auths() {
         // Wait for all to complete
         let mut authenticated_uids = Vec::new();
         for handle in results {
-            if let Ok(Ok(uid)) = handle.await {
-                authenticated_uids.push(uid);
+            if let Ok(Ok(auth_result)) = handle.await {
+                authenticated_uids.push(auth_result.uid);
             }
         }
         authenticated_uids
@@ -827,9 +827,9 @@ async fn test_large_uid_number() {
     client_auth_external(&mut client_stream, large_uid, false).await;
     
     let result = server_handle.await.expect("Server task panicked");
-    let authenticated_uid = result.expect("Auth should succeed with large UID");
+    let auth_result = result.expect("Auth should succeed with large UID");
     
-    assert_eq!(authenticated_uid, large_uid);
+    assert_eq!(auth_result.uid, large_uid);
 }
 
 // ============================================================================

@@ -388,6 +388,7 @@ pub mod error_names {
     pub const NO_REPLY: &str = "org.freedesktop.DBus.Error.NoReply";
     pub const MATCH_RULE_NOT_FOUND: &str = "org.freedesktop.DBus.Error.MatchRuleNotFound";
     pub const MATCH_RULE_INVALID: &str = "org.freedesktop.DBus.Error.MatchRuleInvalid";
+    pub const UNIX_PROCESS_ID_UNKNOWN: &str = "org.freedesktop.DBus.Error.UnixProcessIdUnknown";
 }
 
 #[cfg(test)]
