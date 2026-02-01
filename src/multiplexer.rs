@@ -16,6 +16,7 @@ use crate::auth::SaslAuth;
 use crate::bus_connection::BusConnection;
 use crate::client::ClientHandler;
 use crate::error::Result;
+use crate::match_rules::{ClientMatchRules, MatchRule};
 use crate::message::{
     clone_reply_with_serial, parse_name_owner_changed, ErrorBuilder, MessageExt, 
     MethodReturnBuilder, error_names,
@@ -81,6 +82,8 @@ struct ClientInfo {
     tx: mpsc::Sender<Arc<Message>>,
     /// Names owned by this client.
     owned_names: std::collections::HashSet<String>,
+    /// Match rules for signal filtering.
+    match_rules: ClientMatchRules,
 }
 
 impl Multiplexer {
@@ -235,6 +238,7 @@ impl Multiplexer {
                             unique_name: unique_name.clone(),
                             tx: outbound_tx,
                             owned_names: std::collections::HashSet::new(),
+                            match_rules: ClientMatchRules::new(),
                         });
                     }
 
@@ -347,6 +351,8 @@ impl Multiplexer {
             "GetConnectionUnixProcessID" => self.handle_get_connection_unix_process_id(client_id, &msg).await,
             "GetConnectionCredentials" => self.handle_get_connection_credentials(client_id, &msg).await,
             "ListQueuedOwners" => self.handle_list_queued_owners(client_id, &msg).await,
+            "AddMatch" => self.handle_add_match(client_id, &msg).await,
+            "RemoveMatch" => self.handle_remove_match(client_id, &msg).await,
             "Introspect" => self.handle_introspect(client_id, &msg).await,
             "GetAll" => self.handle_get_all(client_id, &msg).await,
             _ => {
@@ -648,7 +654,7 @@ impl Multiplexer {
 
     /// Handle the GetConnectionUnixProcessID method.
     async fn handle_get_connection_unix_process_id(&self, client_id: ClientId, msg: &Message) {
-        let name: String = match msg.body().deserialize() {
+        let _name: String = match msg.body().deserialize() {
             Ok(v) => v,
             Err(e) => {
                 self.send_error_to_client(client_id, msg, error_names::INVALID_ARGS, &format!("Invalid arguments: {}", e)).await;
@@ -663,7 +669,7 @@ impl Multiplexer {
 
     /// Handle the GetConnectionCredentials method.
     async fn handle_get_connection_credentials(&self, client_id: ClientId, msg: &Message) {
-        let name: String = match msg.body().deserialize() {
+        let _name: String = match msg.body().deserialize() {
             Ok(v) => v,
             Err(e) => {
                 self.send_error_to_client(client_id, msg, error_names::INVALID_ARGS, &format!("Invalid arguments: {}", e)).await;
@@ -672,6 +678,8 @@ impl Multiplexer {
         };
 
         // Return credentials as a{sv}
+        // Note: In a full implementation, we'd look up the connection by name
+        // and return its credentials. For now, return our own credentials.
         let uid = nix::unistd::getuid().as_raw();
         let pid = std::process::id();
         
@@ -755,9 +763,21 @@ impl Multiplexer {
       <arg direction="in" type="s"/>
       <arg direction="out" type="as"/>
     </method>
+    <method name="AddMatch">
+      <arg direction="in" type="s"/>
+    </method>
+    <method name="RemoveMatch">
+      <arg direction="in" type="s"/>
+    </method>
     <signal name="NameOwnerChanged">
       <arg type="s"/>
       <arg type="s"/>
+      <arg type="s"/>
+    </signal>
+    <signal name="NameAcquired">
+      <arg type="s"/>
+    </signal>
+    <signal name="NameLost">
       <arg type="s"/>
     </signal>
   </interface>
@@ -776,6 +796,129 @@ impl Multiplexer {
         self.send_reply_to_client(client_id, msg, &introspect_xml).await;
     }
 
+    /// Handle the AddMatch method.
+    async fn handle_add_match(&self, client_id: ClientId, msg: &Message) {
+        let rule_string: String = match msg.body().deserialize() {
+            Ok(v) => v,
+            Err(e) => {
+                self.send_error_to_client(
+                    client_id,
+                    msg,
+                    error_names::INVALID_ARGS,
+                    &format!("Invalid arguments: {}", e),
+                ).await;
+                return;
+            }
+        };
+
+        debug!(client_id = client_id, rule = %rule_string, "AddMatch");
+
+        // Parse the match rule
+        let rule = match MatchRule::parse(&rule_string) {
+            Ok(r) => r,
+            Err(e) => {
+                self.send_error_to_client(
+                    client_id,
+                    msg,
+                    error_names::MATCH_RULE_INVALID,
+                    &format!("Invalid match rule: {}", e),
+                ).await;
+                return;
+            }
+        };
+
+        // Add to client's match rules
+        {
+            let mut clients = self.clients.write().await;
+            if let Some(info) = clients.get_mut(&client_id) {
+                info.match_rules.add(rule);
+                debug!(
+                    client_id = client_id, 
+                    rule_count = info.match_rules.len(),
+                    "Added match rule"
+                );
+            }
+        }
+
+        // Also forward to both buses to receive the signals
+        // This ensures the mux itself receives signals that match the rule
+        let _ = self.container_conn.connection()
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "AddMatch",
+                &(&rule_string,),
+            )
+            .await;
+        
+        let _ = self.host_conn.connection()
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "AddMatch",
+                &(&rule_string,),
+            )
+            .await;
+
+        // AddMatch returns void on success
+        self.send_reply_to_client(client_id, msg, &()).await;
+    }
+
+    /// Handle the RemoveMatch method.
+    async fn handle_remove_match(&self, client_id: ClientId, msg: &Message) {
+        let rule_string: String = match msg.body().deserialize() {
+            Ok(v) => v,
+            Err(e) => {
+                self.send_error_to_client(
+                    client_id,
+                    msg,
+                    error_names::INVALID_ARGS,
+                    &format!("Invalid arguments: {}", e),
+                ).await;
+                return;
+            }
+        };
+
+        debug!(client_id = client_id, rule = %rule_string, "RemoveMatch");
+
+        // Remove from client's match rules
+        let removed = {
+            let mut clients = self.clients.write().await;
+            if let Some(info) = clients.get_mut(&client_id) {
+                let removed = info.match_rules.remove(&rule_string);
+                if removed {
+                    debug!(
+                        client_id = client_id,
+                        rule_count = info.match_rules.len(),
+                        "Removed match rule"
+                    );
+                }
+                removed
+            } else {
+                false
+            }
+        };
+
+        if !removed {
+            self.send_error_to_client(
+                client_id,
+                msg,
+                error_names::MATCH_RULE_NOT_FOUND,
+                "Match rule not found",
+            ).await;
+            return;
+        }
+
+        // Note: We don't remove from the actual buses because other clients
+        // might still be using the same match rule. A production implementation
+        // would ref-count match rules across clients.
+
+        // RemoveMatch returns void on success
+        self.send_reply_to_client(client_id, msg, &()).await;
+    }
+
     /// Handle the GetAll method (org.freedesktop.DBus.Properties).
     async fn handle_get_all(&self, client_id: ClientId, msg: &Message) {
         // For the D-Bus daemon, there are no standard properties, so return empty dict
@@ -791,6 +934,9 @@ impl Multiplexer {
         trace!(
             route = %route,
             msg_type = ?msg.as_ref().primary_header().msg_type(),
+            sender = ?msg.sender_str(),
+            destination = ?msg.destination_str(),
+            reply_serial = ?msg.reply_serial(),
             "Received message from bus"
         );
 
@@ -840,15 +986,37 @@ impl Multiplexer {
             }
         }
 
-        // Handle signals - would need to implement signal matching
+        // Handle signals - filter by match rules
         if msg.is_signal() {
-            // For now, we don't forward signals to clients
-            // A full implementation would track AddMatch rules per client
+            // Forward signals only to clients whose match rules match this signal
+            let clients = self.clients.read().await;
+            let mut forward_count = 0;
+            
+            for (client_id, info) in clients.iter() {
+                // Check if any of the client's match rules match this signal
+                if info.match_rules.matches(&msg) {
+                    if let Err(e) = info.tx.send(msg.clone()).await {
+                        trace!(client_id = client_id, error = %e, "Failed to send signal to client");
+                    } else {
+                        forward_count += 1;
+                    }
+                }
+            }
+            
+            if forward_count > 0 {
+                trace!(
+                    interface = ?msg.interface_str(),
+                    member = ?msg.member_str(),
+                    route = %route,
+                    forward_count = forward_count,
+                    "Forwarded signal to matching clients"
+                );
+            }
         }
     }
 
     /// Send a reply to a client for a given original message.
-    async fn send_reply_to_client<T: serde::Serialize + zbus::zvariant::Type>(
+    async fn send_reply_to_client<T: serde::Serialize + zbus::zvariant::Type + std::fmt::Debug>(
         &self,
         client_id: ClientId,
         original_msg: &Message,
@@ -862,6 +1030,12 @@ impl Multiplexer {
 
             match reply {
                 Ok(msg) => {
+                    trace!(
+                        client_id = client_id,
+                        serial = msg.serial(),
+                        reply_serial = msg.reply_serial(),
+                        "Sending reply to client"
+                    );
                     if let Err(e) = info.tx.send(Arc::new(msg)).await {
                         warn!(client_id = client_id, error = %e, "Failed to send reply to client");
                     }
@@ -870,6 +1044,8 @@ impl Multiplexer {
                     error!(client_id = client_id, error = %e, "Failed to create reply");
                 }
             }
+        } else {
+            warn!(client_id = client_id, "Client not found when sending reply");
         }
     }
 

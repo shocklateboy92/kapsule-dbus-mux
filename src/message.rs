@@ -386,6 +386,8 @@ pub mod error_names {
     pub const ACCESS_DENIED: &str = "org.freedesktop.DBus.Error.AccessDenied";
     pub const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
     pub const NO_REPLY: &str = "org.freedesktop.DBus.Error.NoReply";
+    pub const MATCH_RULE_NOT_FOUND: &str = "org.freedesktop.DBus.Error.MatchRuleNotFound";
+    pub const MATCH_RULE_INVALID: &str = "org.freedesktop.DBus.Error.MatchRuleInvalid";
 }
 
 #[cfg(test)]

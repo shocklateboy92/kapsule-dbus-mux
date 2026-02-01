@@ -9,6 +9,7 @@ pub mod auth;
 pub mod bus_connection;
 pub mod client;
 pub mod error;
+pub mod match_rules;
 pub mod message;
 pub mod multiplexer;
 pub mod router;

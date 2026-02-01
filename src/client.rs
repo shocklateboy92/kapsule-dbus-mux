@@ -351,6 +351,7 @@ impl ClientHandler {
             serial = msg.serial(),
             msg_type = ?msg.primary_header().msg_type(),
             destination = ?msg.destination_str(),
+            interface = ?msg.interface_str(),
             member = ?msg.member_str(),
             "Received message from client"
         );

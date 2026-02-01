@@ -85,6 +85,17 @@ impl MessageRouter {
         // Clone the message with the new serial
         let forwarded_msg = clone_message_with_serial(msg, forwarded_serial)?;
 
+        debug!(
+            client_id = client_id,
+            client_serial = client_serial,
+            forwarded_serial = forwarded_serial,
+            route = %route,
+            destination = ?msg.destination_str(),
+            interface = ?msg.interface_str(),
+            member = ?msg.member_str(),
+            "Forwarding method call"
+        );
+
         // Forward the message with the new serial
         conn.send(&forwarded_msg).await?;
 
