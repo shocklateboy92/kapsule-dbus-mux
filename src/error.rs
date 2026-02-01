@@ -135,6 +135,10 @@ pub enum MessageError {
     /// Message body serialization failed.
     #[error("Failed to serialize message body: {0}")]
     SerializeFailed(String),
+
+    /// Message build failed.
+    #[error("Failed to build message: {0}")]
+    BuildFailed(String),
 }
 
 impl From<zbus::zvariant::Error> for Error {

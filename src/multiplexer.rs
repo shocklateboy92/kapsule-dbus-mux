@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use zbus::message::Message;
 
 use crate::auth::SaslAuth;
@@ -18,12 +18,16 @@ use crate::client::ClientHandler;
 use crate::error::Result;
 use crate::match_rules::{ClientMatchRules, MatchRule, MatchRuleRefCount};
 use crate::message::{
-    clone_reply_with_serial, parse_name_owner_changed, ErrorBuilder, MessageExt, 
-    MethodReturnBuilder, error_names,
+    clone_reply_with_serial, clone_signal_with_destination, clone_portal_response_signal,
+    parse_name_owner_changed, ErrorBuilder, MessageExt, MethodReturnBuilder, error_names,
 };
 use crate::name_queue::{
     NameQueueManager,
     request_name_reply,
+};
+use crate::portal_request::{
+    PortalRequestTracker, extract_request_handle,
+    is_portal_response_signal, decode_portal_response,
 };
 use crate::router::MessageRouter;
 use crate::routing::{Route, RoutingTable};
@@ -55,6 +59,8 @@ pub struct Multiplexer {
     match_rule_refcount: Arc<RwLock<MatchRuleRefCount>>,
     /// Name queue manager for tracking ownership queues.
     name_queue: Arc<RwLock<NameQueueManager>>,
+    /// Tracker for XDG portal request handles.
+    portal_requests: Arc<RwLock<PortalRequestTracker>>,
 }
 
 /// Information about a connected client.
@@ -149,6 +155,7 @@ impl Multiplexer {
             client_msg_rx,
             match_rule_refcount: Arc::new(RwLock::new(MatchRuleRefCount::new())),
             name_queue: Arc::new(RwLock::new(NameQueueManager::new())),
+            portal_requests: Arc::new(RwLock::new(PortalRequestTracker::new())),
         })
     }
 
@@ -243,6 +250,12 @@ impl Multiplexer {
                     if count > 0 {
                         debug!(count = count, "Periodic cleanup removed expired pending calls");
                     }
+                    
+                    // Also cleanup expired portal requests
+                    let portal_count = self.portal_requests.write().await.cleanup_expired();
+                    if portal_count > 0 {
+                        debug!(count = portal_count, "Periodic cleanup removed expired portal requests");
+                    }
                 }
             }
         }
@@ -258,6 +271,7 @@ impl Multiplexer {
         let host_conn = self.host_conn.clone();
         let match_rule_refcount = self.match_rule_refcount.clone();
         let name_queue = self.name_queue.clone();
+        let portal_requests = self.portal_requests.clone();
 
         tokio::spawn(async move {
             match ClientHandler::accept(stream, &auth).await {
@@ -337,6 +351,15 @@ impl Multiplexer {
                                 debug!(rule = %rule, bus = "host", 
                                        "Removed match rule from bus on client disconnect");
                             }
+                        }
+                    }
+
+                    // Remove any pending portal requests for this client
+                    {
+                        let removed = portal_requests.write().await.remove_client(client_id);
+                        if removed > 0 {
+                            debug!(client_id = client_id, count = removed,
+                                   "Removed pending portal requests on client disconnect");
                         }
                     }
 
@@ -1301,6 +1324,19 @@ impl Multiplexer {
             let is_error = msg.is_error();
             match self.router.handle_reply(&msg, route).await {
                 Ok(Some((client_id, client_serial))) => {
+                    // Check if this reply contains a portal request handle
+                    if !is_error {
+                        info!(
+                            client_id = client_id,
+                            client_serial = client_serial,
+                            reply_serial = ?msg.reply_serial(),
+                            "About to check for portal request handle"
+                        );
+                        if let Some(request_path) = extract_request_handle(&msg) {
+                            self.portal_requests.write().await.register(request_path, client_id);
+                        }
+                    }
+
                     // Rewrite the reply_serial to match the client's original serial
                     let reply_msg = match clone_reply_with_serial(&msg, client_serial) {
                         Ok(m) => Arc::new(m),
@@ -1351,6 +1387,74 @@ impl Multiplexer {
 
         // Handle signals - filter by match rules
         if msg.is_signal() {
+            // Special handling for portal Request.Response signals
+            // These need to be routed based on the request path, not match rules,
+            // because the path contains the mux's unique name, not the client's.
+            if is_portal_response_signal(&msg) {
+                if let Some(path) = msg.path_str() {
+                    let client_id = self.portal_requests.write().await.lookup_and_remove(&path);
+                    if let Some(client_id) = client_id {
+                        let clients = self.clients.read().await;
+                        if let Some(info) = clients.get(&client_id) {
+                            // Decode the Response body for debugging
+                            decode_portal_response(&msg);
+                            
+                            // Get the mux's unique name on the host bus for path rewriting
+                            let mux_unique_name = self.host_conn.connection().unique_name()
+                                .map(|n| n.as_str().to_string())
+                                .unwrap_or_default();
+                            
+                            // Rewrite the destination and path from the mux's unique name to the client's
+                            let rewritten_msg = match clone_portal_response_signal(&msg, &mux_unique_name, &info.unique_name) {
+                                Ok(m) => {
+                                    trace!(
+                                        original_msg = ?msg,
+                                        rewritten_msg = ?m,
+                                        original_path = %path,
+                                        new_path = ?m.path_str(),
+                                        "Portal Response message rewritten"
+                                    );
+                                    Arc::new(m)
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        client_id = client_id,
+                                        error = %e,
+                                        "Failed to rewrite portal Response, forwarding original"
+                                    );
+                                    msg.clone()
+                                }
+                            };
+                            info!(
+                                direction = "MUX->CLIENT",
+                                client_id = client_id,
+                                original_path = %path,
+                                new_path = ?rewritten_msg.path_str(),
+                                original_dest = ?msg.destination_str(),
+                                new_dest = %info.unique_name,
+                                "Delivering portal Response signal via request tracking"
+                            );
+                            if let Err(e) = info.tx.send(rewritten_msg).await {
+                                warn!(client_id = client_id, error = %e, "Failed to send portal Response to client");
+                            }
+                        } else {
+                            warn!(
+                                client_id = client_id,
+                                path = %path,
+                                "Client disconnected before portal Response could be delivered"
+                            );
+                        }
+                        return; // Signal delivered, no need for match rule processing
+                    } else {
+                        // No tracked request for this path - fall through to match rule processing
+                        debug!(
+                            path = %path,
+                            "Portal Response signal has no tracked request, trying match rules"
+                        );
+                    }
+                }
+            }
+
             // Check if this signal is specifically addressed to the mux (unicast signal)
             // This happens when services like xdg-desktop-portal send Response signals
             // to the mux's unique name on the host bus.

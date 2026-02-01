@@ -5,9 +5,9 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use zbus::message::{Message, Type as MessageType};
+use zbus::message::{Body, Message, Type as MessageType};
 use zbus::names::BusName;
-use zbus::zvariant::Type;
+use zbus::zvariant::{OwnedFd, Type};
 
 use crate::error::{MessageError, Result};
 
@@ -245,14 +245,151 @@ pub fn clone_reply_with_serial(msg: &Message, new_reply_serial: u32) -> Result<M
     let body_data = body.data();
     let body_bytes = body_data.bytes();
     
+    // Clone file descriptors from the original message
+    let fds = clone_fds_from_body(&body)?;
+    
     // Get signature - clone the reference
     let sig = header.signature().clone();
     
     // SAFETY: We're rebuilding from valid message bytes
     let new_msg = unsafe {
-        builder.build_raw_body(body_bytes, sig, Vec::new())?
+        builder.build_raw_body(body_bytes, sig, fds)?
     };
     Ok(new_msg)
+}
+
+/// Clone a signal with a new destination.
+///
+/// This is used for portal Response signals where the destination needs to be
+/// rewritten from the mux's unique name to the client's unique name.
+///
+/// # Arguments
+/// * `msg` - The original signal message
+/// * `new_destination` - The new destination to set
+///
+/// # Returns
+/// A new message with the same content but different destination
+pub fn clone_signal_with_destination(msg: &Message, new_destination: &str) -> Result<Message> {
+    let header = msg.header();
+    let primary = msg.primary_header();
+    
+    // Start with a builder from the header but override the destination
+    let mut builder = zbus::message::Builder::from(header.clone())
+        .destination(new_destination)
+        .map_err(|e| MessageError::BuildFailed(e.to_string()))?;
+    
+    // Set a new serial for this message (it will get its own serial)
+    if let Some(serial) = NonZeroU32::new(primary.serial_num().get()) {
+        builder = builder.serial(serial);
+    }
+    
+    // Build with the original body bytes
+    let body = msg.body();
+    let body_data = body.data();
+    let body_bytes = body_data.bytes();
+    
+    // Clone file descriptors from the original message
+    let fds = clone_fds_from_body(&body)?;
+    
+    // Get signature - clone the reference
+    let sig = header.signature().clone();
+    
+    // SAFETY: We're rebuilding from valid message bytes
+    let new_msg = unsafe {
+        builder.build_raw_body(body_bytes, sig, fds)?
+    };
+    Ok(new_msg)
+}
+
+/// Clone a portal Response signal with path rewriting.
+///
+/// Portal Response signals have paths like `/org/freedesktop/portal/desktop/request/1_156/token`
+/// where `1_156` is derived from the caller's unique name (`:1.156` → `1_156`).
+/// When proxying through the mux, we need to rewrite this path to use the client's unique name.
+///
+/// # Arguments
+/// * `msg` - The original signal message
+/// * `mux_unique_name` - The mux's unique name on the host bus (e.g., ":1.88")
+/// * `client_unique_name` - The client's unique name (e.g., ":mux.3")
+///
+/// # Returns
+/// A new message with rewritten path and destination
+pub fn clone_portal_response_signal(
+    msg: &Message,
+    mux_unique_name: &str,
+    client_unique_name: &str,
+) -> Result<Message> {
+    use zbus::zvariant::ObjectPath;
+    
+    let header = msg.header();
+    let primary = msg.primary_header();
+    
+    // Convert unique names to the format used in paths
+    // ":1.88" -> "1_88", ":mux.3" -> "mux_3"
+    let mux_path_component = unique_name_to_path_component(mux_unique_name);
+    let client_path_component = unique_name_to_path_component(client_unique_name);
+    
+    // Get the original path and rewrite it
+    let original_path = header.path().map(|p| p.as_str()).unwrap_or("");
+    let new_path = original_path.replace(&mux_path_component, &client_path_component);
+    let new_path_obj = ObjectPath::try_from(new_path.as_str())
+        .map_err(|e| MessageError::BuildFailed(format!("Invalid path: {}", e)))?;
+    
+    // Start with a builder from the header but override destination and path
+    let mut builder = zbus::message::Builder::from(header.clone())
+        .destination(client_unique_name)
+        .map_err(|e| MessageError::BuildFailed(e.to_string()))?
+        .path(new_path_obj)
+        .map_err(|e| MessageError::BuildFailed(e.to_string()))?;
+    
+    // Set a new serial for this message (it will get its own serial)
+    if let Some(serial) = NonZeroU32::new(primary.serial_num().get()) {
+        builder = builder.serial(serial);
+    }
+    
+    // Build with the original body bytes
+    let body = msg.body();
+    let body_data = body.data();
+    let body_bytes = body_data.bytes();
+    
+    // Clone file descriptors from the original message
+    let fds = clone_fds_from_body(&body)?;
+    
+    // Get signature - clone the reference
+    let sig = header.signature().clone();
+    
+    // SAFETY: We're rebuilding from valid message bytes
+    let new_msg = unsafe {
+        builder.build_raw_body(body_bytes, sig, fds)?
+    };
+    Ok(new_msg)
+}
+
+/// Convert a D-Bus unique name to the format used in portal paths.
+/// ":1.88" -> "1_88"
+/// ":mux.3" -> "mux_3"
+fn unique_name_to_path_component(unique_name: &str) -> String {
+    unique_name
+        .trim_start_matches(':')
+        .replace('.', "_")
+}
+
+/// Clone file descriptors from a message body.
+///
+/// File descriptors need to be cloned when rebuilding messages with build_raw_body
+/// because the builder takes ownership of them.
+fn clone_fds_from_body(body: &Body) -> Result<Vec<OwnedFd>> {
+    let body_data = body.data();
+    let fds = body_data.fds();
+    
+    let mut cloned_fds = Vec::with_capacity(fds.len());
+    for fd in fds {
+        let owned = fd.try_to_owned()
+            .map_err(|e| MessageError::BuildFailed(format!("Failed to clone fd: {}", e)))?;
+        cloned_fds.push(owned.into());
+    }
+    
+    Ok(cloned_fds)
 }
 
 /// Parse a NameOwnerChanged signal body.
