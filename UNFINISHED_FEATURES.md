@@ -2,31 +2,38 @@
 
 This document tracks incomplete features, stub implementations, and potential improvements identified in the kapsule-dbus-mux codebase.
 
-## Unfinished Features
+## Implemented Features
 
 ### 1. Name Queue Management
 
-**Status:** Not implemented
+**Status:** ✅ Implemented
 
-**Description:** The D-Bus specification supports name ownership queuing, where multiple clients can request the same name and be placed in a queue. The mux currently forwards `RequestName`/`ReleaseName` to the container bus but doesn't manage a unified queue across both buses.
+**Location:** `src/name_queue.rs` and integrated into `src/multiplexer.rs`
 
-**What's missing:**
-- Local tracking of name ownership queues
+**Description:** The D-Bus specification supports name ownership queuing, where multiple clients can request the same name and be placed in a queue. The mux now manages a local name queue for its clients.
+
+**What was implemented:**
+- Local tracking of name ownership queues via `NameQueueManager`
 - Proper handling of `RequestName` flags:
   - `ALLOW_REPLACEMENT` (0x1) - Client allows being replaced
   - `REPLACE_EXISTING` (0x2) - Try to replace current owner
   - `DO_NOT_QUEUE` (0x4) - Don't wait in queue if name taken
 - Proper handling of reply codes:
+  - `PRIMARY_OWNER` (1) - Caller is now the primary owner
   - `IN_QUEUE` (2) - Client is queued waiting for name
   - `EXISTS` (3) - Name exists, DO_NOT_QUEUE was set
-  - `NON_EXISTENT` (2) - Name doesn't exist (for ReleaseName)
+  - `ALREADY_OWNER` (4) - Caller was already owner
+- `ReleaseName` reply codes:
+  - `RELEASED` (1) - Name released successfully
+  - `NON_EXISTENT` (2) - Name doesn't exist
   - `NOT_OWNER` (3) - Caller doesn't own the name
-
-**Impact:** `ListQueuedOwners` returns a stub response (see `src/multiplexer.rs` around line 800).
-
-**Recommendation:** For most container use cases, this is low priority. Name queuing is rarely used by applications. Consider implementing only if real-world usage requires it.
+- `ListQueuedOwners` returns the actual queue (primary owner + waiters)
+- Automatic ownership transfer when primary owner disconnects
+- 20 unit tests covering all queue management scenarios
 
 ---
+
+## Unfinished Features
 
 ### 2. Match Rule Reference Counting
 

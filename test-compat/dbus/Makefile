@@ -30,7 +30,7 @@ COMMON_CFLAGS := $(CFLAGS) $(PKG_CFLAGS) -pthread
 COMMON_LDFLAGS := $(PKG_LIBS) -pthread
 
 # Test executables
-TEST_BINS := test-mux-driver
+TEST_BINS := test-broker test-driver test-matches test-lifetime
 
 # Default MUX path (can be overridden)
 MUX_PATH ?= $(shell pwd)/../../target/debug/kapsule-dbus-mux
@@ -39,8 +39,17 @@ MUX_PATH ?= $(shell pwd)/../../target/debug/kapsule-dbus-mux
 
 all: $(TEST_BINS)
 
-# Build test executable (header-only utility, no separate object file needed)
-test-mux-driver: test-mux-driver.c util-broker-mux.h
+# Build test executables (header-only utility, no separate object file needed)
+test-broker: test-broker.c util-broker-mux.h
+	$(CC) $(COMMON_CFLAGS) $< $(COMMON_LDFLAGS) -o $@
+
+test-driver: test-driver.c util-broker-mux.h
+	$(CC) $(COMMON_CFLAGS) $< $(COMMON_LDFLAGS) -o $@
+
+test-matches: test-matches.c util-broker-mux.h
+	$(CC) $(COMMON_CFLAGS) $< $(COMMON_LDFLAGS) -o $@
+
+test-lifetime: test-lifetime.c util-broker-mux.h
 	$(CC) $(COMMON_CFLAGS) $< $(COMMON_LDFLAGS) -o $@
 
 # Run tests
@@ -61,7 +70,13 @@ test: all
 	fi
 	@echo "Using MUX binary: $(MUX_PATH)"
 	@echo ""
-	DBUS_BROKER_TEST_MUX="$(MUX_PATH)" ./test-mux-driver
+	@echo "=== test-broker ===" && DBUS_BROKER_TEST_MUX="$(MUX_PATH)" ./test-broker && echo ""
+	@echo "=== test-driver ===" && DBUS_BROKER_TEST_MUX="$(MUX_PATH)" ./test-driver && echo ""
+	@echo "=== test-matches ===" && DBUS_BROKER_TEST_MUX="$(MUX_PATH)" ./test-matches && echo ""
+	@echo "=== test-lifetime ===" && DBUS_BROKER_TEST_MUX="$(MUX_PATH)" ./test-lifetime && echo ""
+	@echo "=========================================="
+	@echo "All tests passed!"
+	@echo "=========================================="
 
 check: test
 

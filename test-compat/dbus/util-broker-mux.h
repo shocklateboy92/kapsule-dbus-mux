@@ -504,6 +504,7 @@ static inline void util_broker_consume_method_return(sd_bus *bus) {
     
     for (;;) {
         _c_cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
+        uint8_t type;
         
         r = sd_bus_process(bus, &message);
         c_assert(r >= 0);
@@ -514,7 +515,10 @@ static inline void util_broker_consume_method_return(sd_bus *bus) {
             continue;
         }
         
-        if (sd_bus_message_get_type(message) == SD_BUS_MESSAGE_METHOD_RETURN) {
+        r = sd_bus_message_get_type(message, &type);
+        c_assert(r >= 0);
+        
+        if (type == SD_BUS_MESSAGE_METHOD_RETURN) {
             return;
         }
     }
@@ -528,6 +532,7 @@ static inline void util_broker_consume_method_error(sd_bus *bus, const char *nam
     
     for (;;) {
         _c_cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
+        uint8_t type;
         
         r = sd_bus_process(bus, &message);
         c_assert(r >= 0);
@@ -538,7 +543,10 @@ static inline void util_broker_consume_method_error(sd_bus *bus, const char *nam
             continue;
         }
         
-        if (sd_bus_message_get_type(message) == SD_BUS_MESSAGE_METHOD_ERROR) {
+        r = sd_bus_message_get_type(message, &type);
+        c_assert(r >= 0);
+        
+        if (type == SD_BUS_MESSAGE_METHOD_ERROR) {
             const sd_bus_error *error = sd_bus_message_get_error(message);
             c_assert(error);
             c_assert(strcmp(error->name, name) == 0);
