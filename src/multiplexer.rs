@@ -1086,14 +1086,17 @@ impl Multiplexer {
             }
         };
 
-        debug!(client_id = client_id, rule = %rule_string, "AddMatch");
+        info!(client_id = client_id, rule = %rule_string, "AddMatch");
 
-        // Log portal Request match rules at INFO level for debugging
-        if rule_string.contains("portal.Request") || rule_string.contains("portal/desktop/request") {
+        // Log portal Request match rules with extra emphasis for debugging
+        if rule_string.contains("portal.Request") 
+            || rule_string.contains("portal/desktop/request") 
+            || rule_string.contains("org.freedesktop.portal")
+        {
             info!(
                 client_id = client_id,
                 rule = %rule_string,
-                "Portal Request match rule"
+                "Portal-related match rule"
             );
         }
 

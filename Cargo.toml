@@ -8,6 +8,10 @@ authors = ["Kapsule Team"]
 repository = "https://github.com/kapsule/kapsule-dbus-mux"
 keywords = ["dbus", "container", "multiplexer", "ipc"]
 categories = ["development-tools", "os::linux-apis"]
+build = "build.rs"
+
+[build-dependencies]
+chrono = "0.4"
 
 [dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }

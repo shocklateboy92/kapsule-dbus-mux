@@ -51,6 +51,9 @@ async fn main() -> Result<()> {
         .init();
 
     info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build_timestamp = env!("BUILD_TIMESTAMP"),
+        git_hash = option_env!("GIT_HASH").unwrap_or("unknown"),
         listen = %args.listen.display(),
         container_bus = %args.container_bus,
         host_bus = ?args.host_bus,

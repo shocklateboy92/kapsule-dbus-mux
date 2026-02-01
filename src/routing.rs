@@ -39,7 +39,22 @@ impl UniqueNameRegistry {
     }
 
     fn register(&mut self, name: String, route: Route) {
-        debug!(name = %name, route = %route, "Registered unique name");
+        if let Some(existing_route) = self.names.get(&name) {
+            if *existing_route != route {
+                tracing::warn!(
+                    name = %name,
+                    existing_route = %existing_route,
+                    new_route = %route,
+                    "Unique name collision: overwriting route for existing name! \
+                     This may cause message misrouting if both buses have clients \
+                     with the same unique name."
+                );
+            } else {
+                debug!(name = %name, route = %route, "Re-registering unique name with same route");
+            }
+        } else {
+            debug!(name = %name, route = %route, "Registered unique name");
+        }
         self.names.insert(name, route);
     }
 
@@ -165,9 +180,21 @@ impl RoutingTable {
             // Name released on container
             if self.container_names.remove(name) {
                 debug!(name = %name, "Name released on container");
+                // Check if this name is now only available on host
+                if self.host_names.contains(name) {
+                    debug!(name = %name, "Name now routes to host (container released)");
+                }
             }
         } else {
             // Name acquired on container - takes priority over host
+            if self.host_names.contains(name) {
+                tracing::warn!(
+                    name = %name,
+                    container_owner = %new_owner,
+                    "Well-known name shadowing: container is acquiring a name that \
+                     also exists on host. Container will take priority."
+                );
+            }
             self.container_names.insert(name.to_string());
             self.unique_names.register(new_owner.to_string(), Route::Container);
             debug!(name = %name, owner = %new_owner, "Name acquired on container");
@@ -192,6 +219,14 @@ impl RoutingTable {
         } else {
             self.host_names.insert(name.to_string());
             self.unique_names.register(new_owner.to_string(), Route::Host);
+            if self.container_names.contains(name) {
+                tracing::warn!(
+                    name = %name,
+                    host_owner = %new_owner,
+                    "Well-known name exists on both buses: host acquired a name that \
+                     container already owns. Messages will route to container."
+                );
+            }
             debug!(name = %name, owner = %new_owner, "Name acquired on host");
         }
     }
