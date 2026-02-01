@@ -4,9 +4,13 @@
 //! to the multiplexer socket. It handles authentication and message forwarding.
 
 use std::collections::HashSet;
+use std::io::IoSlice;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use rustix::net::{SendFlags, sendmsg, SendAncillaryBuffer, SendAncillaryMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -20,12 +24,45 @@ use crate::message::{ErrorBuilder, MessageExt, MethodReturnBuilder};
 use crate::routing::Route;
 use crate::serial_map::ClientId;
 
+/// Maximum number of file descriptors that can be sent in a single message.
+const FDS_MAX: usize = 253;
+
 /// Counter for generating unique client IDs.
 static CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Generate a new unique client ID.
 fn next_client_id() -> ClientId {
     CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Send a message with file descriptors via Unix socket.
+/// File descriptors are passed as ancillary data using SCM_RIGHTS.
+fn fd_sendmsg(fd: BorrowedFd<'_>, buffer: &[u8], fds: &[BorrowedFd<'_>]) -> std::io::Result<usize> {
+    let iov = [IoSlice::new(buffer)];
+    let mut cmsg_buffer = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(FDS_MAX))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut cmsg_buffer);
+
+    if !fds.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(fds)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many file descriptors",
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let flags = SendFlags::NOSIGNAL;
+    #[cfg(target_os = "macos")]
+    let flags = SendFlags::empty();
+
+    let sent = sendmsg(fd, &iov, &mut ancillary, flags)?;
+    if sent == 0 && !buffer.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "failed to write to buffer",
+        ));
+    }
+
+    Ok(sent)
 }
 
 /// A connected client.
@@ -306,13 +343,47 @@ impl ClientHandler {
         self.send_message(&reply).await
     }
 
-    /// Send a message to the client.
+    /// Send a message to the client, including file descriptors if present.
     pub async fn send_message(&mut self, msg: &Message) -> Result<()> {
+        let body = msg.body();
+        let body_data = body.data();
+        let fds = body_data.fds();
         let data = msg.data();
-        self.stream.write_all(data.bytes()).await?;
+        let bytes = data.bytes();
+        
+        if fds.is_empty() {
+            // No FDs - use simple write
+            self.stream.write_all(bytes).await?;
+        } else {
+            // Has FDs - use sendmsg with SCM_RIGHTS
+            // Convert FDs to BorrowedFd
+            let borrowed_fds: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
+            
+            // We need to use blocking sendmsg since tokio UnixStream doesn't expose sendmsg
+            // Wait for writable first
+            self.stream.writable().await?;
+            
+            // Use try_io to send with FDs
+            let result = self.stream.try_io(tokio::io::Interest::WRITABLE, || {
+                fd_sendmsg(self.stream.as_fd(), bytes, &borrowed_fds)
+            });
+            
+            match result {
+                Ok(sent) if sent == bytes.len() => {
+                    // All data sent
+                }
+                Ok(sent) => {
+                    // Partial send - FDs are sent with first chunk, now send rest without FDs
+                    self.stream.write_all(&bytes[sent..]).await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        
         trace!(
             client_id = self.client.id,
             serial = msg.serial(),
+            fd_count = fds.len(),
             "Sent message to client"
         );
         Ok(())

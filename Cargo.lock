@@ -497,6 +497,7 @@ dependencies = [
  "futures",
  "hex",
  "nix",
+ "rustix",
  "serde",
  "tempfile",
  "thiserror",
