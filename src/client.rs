@@ -121,9 +121,6 @@ pub struct ClientHandler {
     client: ClientConnection,
     /// The raw Unix stream.
     stream: UnixStream,
-    /// Receive channel for outbound messages.
-    #[allow(dead_code)]
-    rx: mpsc::Receiver<Arc<Message>>,
     /// Buffer for reading messages.
     read_buf: Vec<u8>,
     /// Data buffered during authentication that needs to be processed first.
@@ -161,7 +158,7 @@ impl ClientHandler {
         let unique_name = format!(":mux.{}", id);
 
         // Create message channel
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, _rx) = mpsc::channel(256);
 
         let client = ClientConnection {
             id,
@@ -176,7 +173,6 @@ impl ClientHandler {
         Ok(Self {
             client,
             stream,
-            rx,
             read_buf: vec![0u8; 16384],
             pending_data: buffered_data,
             pending_pos: 0,

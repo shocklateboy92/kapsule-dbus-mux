@@ -60,7 +60,7 @@ impl BusConnection {
     ///
     /// # Arguments
     /// * `address` - Optional override for the session bus address.
-    ///               If None, uses DBUS_SESSION_BUS_ADDRESS env var.
+    ///   If None, uses DBUS_SESSION_BUS_ADDRESS env var.
     /// * `name` - A human-readable name for logging.
     pub async fn connect_session(address: Option<&str>, name: impl Into<String>) -> Result<Self> {
         let name = name.into();

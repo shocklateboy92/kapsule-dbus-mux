@@ -120,22 +120,6 @@ impl MessageRouter {
         Ok(())
     }
 
-    /// Forward a signal to clients.
-    ///
-    /// Signals are typically broadcast and don't need reply correlation.
-    pub async fn forward_signal(&self, msg: &Message, route: Route) -> Result<()> {
-        // For now, just log the signal
-        // In a full implementation, we'd track which clients are interested
-        // in which signals (via AddMatch) and forward accordingly
-        trace!(
-            interface = ?msg.interface_str(),
-            member = ?msg.member_str(),
-            route = %route,
-            "Received signal"
-        );
-        Ok(())
-    }
-
     /// Handle a reply from one of the buses.
     ///
     /// Returns the client ID and modified message if we have a pending call.
@@ -177,35 +161,5 @@ impl MessageRouter {
             debug!(count = count, "Cleaned up expired pending calls");
         }
         count
-    }
-}
-
-/// Information about a message and where it should go.
-#[derive(Debug)]
-pub struct RoutedMessage {
-    /// The message to send.
-    pub message: Arc<Message>,
-    /// Where to send it.
-    pub route: Route,
-    /// The client that sent this message (for reply correlation).
-    pub client_id: ClientId,
-    /// The original serial number from the client.
-    pub client_serial: u32,
-}
-
-impl RoutedMessage {
-    /// Create a new routed message.
-    pub fn new(
-        message: Arc<Message>,
-        route: Route,
-        client_id: ClientId,
-        client_serial: u32,
-    ) -> Self {
-        Self {
-            message,
-            route,
-            client_id,
-            client_serial,
-        }
     }
 }

@@ -25,29 +25,15 @@ use crate::router::MessageRouter;
 use crate::routing::{Route, RoutingTable};
 use crate::serial_map::ClientId;
 
-/// D-Bus request name flags.
-#[allow(dead_code)]
-mod request_name_flags {
-    pub const ALLOW_REPLACEMENT: u32 = 0x1;
-    pub const REPLACE_EXISTING: u32 = 0x2;
-    pub const DO_NOT_QUEUE: u32 = 0x4;
-}
-
 /// D-Bus request name reply codes.
-#[allow(dead_code)]
 mod request_name_reply {
     pub const PRIMARY_OWNER: u32 = 1;
-    pub const IN_QUEUE: u32 = 2;
-    pub const EXISTS: u32 = 3;
     pub const ALREADY_OWNER: u32 = 4;
 }
 
 /// D-Bus release name reply codes.
-#[allow(dead_code)]
 mod release_name_reply {
     pub const RELEASED: u32 = 1;
-    pub const NON_EXISTENT: u32 = 2;
-    pub const NOT_OWNER: u32 = 3;
 }
 
 /// The D-Bus multiplexer.
