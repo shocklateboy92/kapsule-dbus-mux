@@ -341,6 +341,78 @@ impl ClientMatchRules {
     pub fn len(&self) -> usize {
         self.rules.len()
     }
+
+    /// Get all rule strings for this client.
+    pub fn rule_strings(&self) -> Vec<String> {
+        self.rules.iter().map(|r| r.rule_string.clone()).collect()
+    }
+}
+
+/// Tracks reference counts for match rules on upstream buses.
+///
+/// When multiple clients add the same match rule, we only forward it to
+/// the upstream bus once. When all clients remove the rule, we remove it
+/// from the upstream bus.
+#[derive(Debug, Default)]
+pub struct MatchRuleRefCount {
+    /// Reference counts per rule string for each bus.
+    /// Key: (bus_name, rule_string), Value: count
+    counts: std::collections::HashMap<(String, String), usize>,
+}
+
+impl MatchRuleRefCount {
+    /// Create a new empty reference counter.
+    pub fn new() -> Self {
+        Self {
+            counts: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Increment the reference count for a rule on a bus.
+    /// Returns true if this is the first reference (rule should be added to bus).
+    pub fn increment(&mut self, bus: &str, rule: &str) -> bool {
+        let key = (bus.to_string(), rule.to_string());
+        let count = self.counts.entry(key).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// Decrement the reference count for a rule on a bus.
+    /// Returns true if this was the last reference (rule should be removed from bus).
+    pub fn decrement(&mut self, bus: &str, rule: &str) -> bool {
+        let key = (bus.to_string(), rule.to_string());
+        if let Some(count) = self.counts.get_mut(&key) {
+            if *count > 0 {
+                *count -= 1;
+                if *count == 0 {
+                    self.counts.remove(&key);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get all rules for a specific bus that have non-zero refcount.
+    pub fn rules_for_bus(&self, bus: &str) -> Vec<String> {
+        self.counts
+            .iter()
+            .filter(|((b, _), count)| b == bus && **count > 0)
+            .map(|((_, rule), _)| rule.clone())
+            .collect()
+    }
+
+    /// Remove all references for rules associated with a specific client's rules.
+    /// Returns a list of (bus, rule) pairs that should be removed from buses.
+    pub fn remove_client_rules(&mut self, bus: &str, rules: &[String]) -> Vec<String> {
+        let mut to_remove = Vec::new();
+        for rule in rules {
+            if self.decrement(bus, rule) {
+                to_remove.push(rule.clone());
+            }
+        }
+        to_remove
+    }
 }
 
 #[cfg(test)]
@@ -484,5 +556,68 @@ mod tests {
     fn test_parse_destination() {
         let rule = MatchRule::parse("destination=':1.42'").unwrap();
         assert_eq!(rule.destination, Some(":1.42".to_string()));
+    }
+
+    #[test]
+    fn test_match_rule_refcount_basic() {
+        let mut refcount = MatchRuleRefCount::new();
+        
+        // First add returns true (should add to bus)
+        assert!(refcount.increment("container", "type='signal'"));
+        
+        // Second add returns false (already on bus)
+        assert!(!refcount.increment("container", "type='signal'"));
+        
+        // First remove returns false (still has references)
+        assert!(!refcount.decrement("container", "type='signal'"));
+        
+        // Second remove returns true (last reference, should remove from bus)
+        assert!(refcount.decrement("container", "type='signal'"));
+        
+        // Decrement on non-existent rule returns false
+        assert!(!refcount.decrement("container", "type='signal'"));
+    }
+
+    #[test]
+    fn test_match_rule_refcount_multiple_buses() {
+        let mut refcount = MatchRuleRefCount::new();
+        
+        // Add same rule to different buses
+        assert!(refcount.increment("container", "type='signal'"));
+        assert!(refcount.increment("host", "type='signal'"));
+        
+        // Remove from one bus doesn't affect the other
+        assert!(refcount.decrement("container", "type='signal'"));
+        assert!(refcount.decrement("host", "type='signal'"));
+    }
+
+    #[test]
+    fn test_match_rule_refcount_rules_for_bus() {
+        let mut refcount = MatchRuleRefCount::new();
+        
+        refcount.increment("container", "type='signal'");
+        refcount.increment("container", "interface='org.example'");
+        refcount.increment("host", "type='signal'");
+        
+        let container_rules = refcount.rules_for_bus("container");
+        assert_eq!(container_rules.len(), 2);
+        assert!(container_rules.contains(&"type='signal'".to_string()));
+        assert!(container_rules.contains(&"interface='org.example'".to_string()));
+        
+        let host_rules = refcount.rules_for_bus("host");
+        assert_eq!(host_rules.len(), 1);
+        assert!(host_rules.contains(&"type='signal'".to_string()));
+    }
+
+    #[test]
+    fn test_client_match_rules_rule_strings() {
+        let mut rules = ClientMatchRules::new();
+        rules.add(MatchRule::parse("type='signal'").unwrap());
+        rules.add(MatchRule::parse("interface='org.example'").unwrap());
+        
+        let strings = rules.rule_strings();
+        assert_eq!(strings.len(), 2);
+        assert!(strings.contains(&"type='signal'".to_string()));
+        assert!(strings.contains(&"interface='org.example'".to_string()));
     }
 }

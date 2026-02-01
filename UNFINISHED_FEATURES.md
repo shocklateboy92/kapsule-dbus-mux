@@ -30,43 +30,32 @@ This document tracks incomplete features, stub implementations, and potential im
 
 ### 2. Match Rule Reference Counting
 
-**Status:** Partial implementation
+**Status:** ✅ Implemented
 
-**Location:** `src/multiplexer.rs` in `handle_add_match` and `handle_remove_match`
+**Location:** `src/match_rules.rs` (`MatchRuleRefCount`) and `src/multiplexer.rs`
 
-**Description:** Match rules are added to both upstream buses when a client calls `AddMatch`, but they're never removed from the buses when clients call `RemoveMatch` or disconnect.
+**Description:** Match rules are now properly reference-counted across clients. When multiple clients add the same match rule, it's only forwarded to upstream buses once. When all clients remove the rule (or disconnect), it's removed from the buses.
 
-**Current behavior:**
-```rust
-// Note: We don't remove from the actual buses because other clients
-// might still be using the same match rule. A production implementation
-// would ref-count match rules across clients.
-```
-
-**What's missing:**
-- Reference counting of match rules across all clients
-- Removal from upstream buses when refcount reaches zero
-- Cleanup of match rules when clients disconnect
-
-**Impact:** Potential resource leak over long-running sessions with many client connections.
-
-**Recommendation:** Medium priority. Implement refcounting for match rules to prevent resource leaks.
+**Implementation:**
+- `MatchRuleRefCount` struct tracks reference counts per (bus, rule) pair
+- `handle_add_match` increments refcount and only adds to bus if count becomes 1
+- `handle_remove_match` decrements refcount and only removes from bus if count becomes 0
+- Client disconnect handler cleans up all match rules for disconnecting clients
 
 ---
 
 ### 3. Periodic Cleanup of Expired Pending Calls
 
-**Status:** Not implemented
+**Status:** ✅ Implemented
 
-**Description:** `SerialMap::cleanup_expired()` exists but is never called periodically.
+**Location:** `src/multiplexer.rs` in `run()` method
 
-**What's missing:**
-- A background task that periodically calls `cleanup_expired()`
-- Configuration for cleanup interval
+**Description:** The multiplexer now runs a periodic cleanup task every 30 seconds that calls `router.cleanup_expired()` to remove stale pending call entries.
 
-**Impact:** Long-running instances could accumulate stale pending call entries if replies are never received (e.g., destination crashed).
-
-**Recommendation:** Low priority. Add a periodic cleanup task (e.g., every 30 seconds).
+**Implementation:**
+- Uses `tokio::time::interval(Duration::from_secs(30))` in the main event loop
+- Calls `self.router.cleanup_expired().await` on each tick
+- Uses `MissedTickBehavior::Skip` to avoid catching up if the system is busy
 
 ---
 

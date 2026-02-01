@@ -16,7 +16,7 @@ use crate::auth::SaslAuth;
 use crate::bus_connection::BusConnection;
 use crate::client::ClientHandler;
 use crate::error::Result;
-use crate::match_rules::{ClientMatchRules, MatchRule};
+use crate::match_rules::{ClientMatchRules, MatchRule, MatchRuleRefCount};
 use crate::message::{
     clone_reply_with_serial, parse_name_owner_changed, ErrorBuilder, MessageExt, 
     MethodReturnBuilder, error_names,
@@ -58,6 +58,8 @@ pub struct Multiplexer {
     client_msg_tx: mpsc::Sender<(ClientId, Message)>,
     /// Channel receiver for client messages.
     client_msg_rx: mpsc::Receiver<(ClientId, Message)>,
+    /// Reference counting for match rules on upstream buses.
+    match_rule_refcount: Arc<RwLock<MatchRuleRefCount>>,
 }
 
 /// Information about a connected client.
@@ -150,6 +152,7 @@ impl Multiplexer {
             auth: SaslAuth::new(),
             client_msg_tx,
             client_msg_rx,
+            match_rule_refcount: Arc::new(RwLock::new(MatchRuleRefCount::new())),
         })
     }
 
@@ -181,6 +184,10 @@ impl Multiplexer {
     pub async fn run(mut self) -> Result<()> {
         info!("Multiplexer starting");
 
+        // Periodic cleanup interval (30 seconds)
+        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 // Accept new client connections
@@ -209,6 +216,14 @@ impl Multiplexer {
                 Some((client_id, msg)) = self.client_msg_rx.recv() => {
                     self.handle_client_message(client_id, msg).await;
                 }
+
+                // Periodic cleanup of expired pending calls
+                _ = cleanup_interval.tick() => {
+                    let count = self.router.cleanup_expired().await;
+                    if count > 0 {
+                        debug!(count = count, "Periodic cleanup removed expired pending calls");
+                    }
+                }
             }
         }
     }
@@ -220,6 +235,8 @@ impl Multiplexer {
         let clients = self.clients.clone();
         let routing_table = self.routing_table.clone();
         let container_conn = self.container_conn.clone();
+        let host_conn = self.host_conn.clone();
+        let match_rule_refcount = self.match_rule_refcount.clone();
 
         tokio::spawn(async move {
             match ClientHandler::accept(stream, &auth).await {
@@ -255,14 +272,50 @@ impl Multiplexer {
                         warn!(client_id = client_id, error = %e, "Client handler error");
                     }
 
-                    // Unregister client
+                    // Unregister client and collect owned names and match rules
                     let owned_names: Vec<String>;
+                    let match_rules: Vec<String>;
                     {
                         let mut clients = clients.write().await;
                         if let Some(info) = clients.remove(&client_id) {
                             owned_names = info.owned_names.into_iter().collect();
+                            match_rules = info.match_rules.rule_strings();
                         } else {
                             owned_names = Vec::new();
+                            match_rules = Vec::new();
+                        }
+                    }
+
+                    // Release match rules from upstream buses
+                    if !match_rules.is_empty() {
+                        let mut refcount = match_rule_refcount.write().await;
+                        for rule in &match_rules {
+                            if refcount.decrement("container", rule) {
+                                let _ = container_conn.connection()
+                                    .call_method(
+                                        Some("org.freedesktop.DBus"),
+                                        "/org/freedesktop/DBus",
+                                        Some("org.freedesktop.DBus"),
+                                        "RemoveMatch",
+                                        &(rule,),
+                                    )
+                                    .await;
+                                debug!(rule = %rule, bus = "container", 
+                                       "Removed match rule from bus on client disconnect");
+                            }
+                            if refcount.decrement("host", rule) {
+                                let _ = host_conn.connection()
+                                    .call_method(
+                                        Some("org.freedesktop.DBus"),
+                                        "/org/freedesktop/DBus",
+                                        Some("org.freedesktop.DBus"),
+                                        "RemoveMatch",
+                                        &(rule,),
+                                    )
+                                    .await;
+                                debug!(rule = %rule, bus = "host", 
+                                       "Removed match rule from bus on client disconnect");
+                            }
                         }
                     }
 
@@ -931,27 +984,34 @@ impl Multiplexer {
             }
         }
 
-        // Also forward to both buses to receive the signals
-        // This ensures the mux itself receives signals that match the rule
-        let _ = self.container_conn.connection()
-            .call_method(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                Some("org.freedesktop.DBus"),
-                "AddMatch",
-                &(&rule_string,),
-            )
-            .await;
+        // Forward to buses only if this is the first client requesting this rule
+        let mut refcount = self.match_rule_refcount.write().await;
         
-        let _ = self.host_conn.connection()
-            .call_method(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                Some("org.freedesktop.DBus"),
-                "AddMatch",
-                &(&rule_string,),
-            )
-            .await;
+        if refcount.increment("container", &rule_string) {
+            let _ = self.container_conn.connection()
+                .call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "AddMatch",
+                    &(&rule_string,),
+                )
+                .await;
+            debug!(rule = %rule_string, bus = "container", "Added match rule to bus");
+        }
+        
+        if refcount.increment("host", &rule_string) {
+            let _ = self.host_conn.connection()
+                .call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "AddMatch",
+                    &(&rule_string,),
+                )
+                .await;
+            debug!(rule = %rule_string, bus = "host", "Added match rule to bus");
+        }
 
         // AddMatch returns void on success
         self.send_reply_to_client(client_id, msg, &()).await;
@@ -1002,9 +1062,34 @@ impl Multiplexer {
             return;
         }
 
-        // Note: We don't remove from the actual buses because other clients
-        // might still be using the same match rule. A production implementation
-        // would ref-count match rules across clients.
+        // Remove from buses if this was the last client using the rule
+        let mut refcount = self.match_rule_refcount.write().await;
+        
+        if refcount.decrement("container", &rule_string) {
+            let _ = self.container_conn.connection()
+                .call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "RemoveMatch",
+                    &(&rule_string,),
+                )
+                .await;
+            debug!(rule = %rule_string, bus = "container", "Removed match rule from bus");
+        }
+        
+        if refcount.decrement("host", &rule_string) {
+            let _ = self.host_conn.connection()
+                .call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "RemoveMatch",
+                    &(&rule_string,),
+                )
+                .await;
+            debug!(rule = %rule_string, bus = "host", "Removed match rule from bus");
+        }
 
         // RemoveMatch returns void on success
         self.send_reply_to_client(client_id, msg, &()).await;
