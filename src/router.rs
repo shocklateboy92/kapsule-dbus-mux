@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::{debug, trace};
+use tracing::{debug, info, warn};
 use zbus::message::Message;
 
 use crate::bus_connection::BusConnection;
@@ -85,7 +85,8 @@ impl MessageRouter {
         // Clone the message with the new serial
         let forwarded_msg = clone_message_with_serial(msg, forwarded_serial)?;
 
-        debug!(
+        info!(
+            direction = "MUX->BUS",
             client_id = client_id,
             client_serial = client_serial,
             forwarded_serial = forwarded_serial,
@@ -93,7 +94,9 @@ impl MessageRouter {
             destination = ?msg.destination_str(),
             interface = ?msg.interface_str(),
             member = ?msg.member_str(),
-            "Forwarding method call"
+            path = ?msg.path_str(),
+            "Forwarding method call to bus (expecting reply with serial={})",
+            forwarded_serial
         );
 
         // Forward the message with the new serial
@@ -109,12 +112,12 @@ impl MessageRouter {
             client_serial,
         );
 
-        trace!(
+        debug!(
             client_id = client_id,
             client_serial = client_serial,
             forwarded_serial = forwarded_serial,
             route = %route,
-            "Forwarded method call with serial translation"
+            "Recorded pending call mapping"
         );
 
         Ok(())
@@ -135,20 +138,22 @@ impl MessageRouter {
         let pending = self.serial_map.write().await.remove(route, reply_serial);
 
         if let Some(pending) = pending {
-            trace!(
+            info!(
+                direction = "BUS->CLIENT",
                 client_id = pending.client_id,
                 client_serial = pending.client_serial,
                 reply_serial = reply_serial,
                 route = %route,
-                "Correlated reply"
+                age_ms = pending.timestamp.elapsed().as_millis(),
+                "Correlated reply - routing to client"
             );
             Ok(Some((pending.client_id, pending.client_serial)))
         } else {
             // No pending call found - might be a stale reply or for a different client
-            trace!(
+            warn!(
                 reply_serial = reply_serial,
                 route = %route,
-                "No pending call for reply"
+                "No pending call found for reply - possible orphan or stale"
             );
             Ok(None)
         }

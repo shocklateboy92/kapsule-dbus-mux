@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use zbus::message::Message;
 
 use crate::auth::SaslAuth;
@@ -199,13 +199,37 @@ impl Multiplexer {
                 }
 
                 // Handle messages from container bus
-                Some(msg) = self.container_conn.recv() => {
-                    self.handle_bus_message(msg, Route::Container).await;
+                result = self.container_conn.recv() => {
+                    match result {
+                        Ok(Some(msg)) => {
+                            self.handle_bus_message(msg, Route::Container).await;
+                        }
+                        Ok(None) => {
+                            error!("Container bus connection closed unexpectedly");
+                            return Err(crate::error::Error::ConnectionClosed("container bus".to_string()));
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Container bus connection failed");
+                            return Err(e);
+                        }
+                    }
                 }
 
                 // Handle messages from host bus
-                Some(msg) = self.host_conn.recv() => {
-                    self.handle_bus_message(msg, Route::Host).await;
+                result = self.host_conn.recv() => {
+                    match result {
+                        Ok(Some(msg)) => {
+                            self.handle_bus_message(msg, Route::Host).await;
+                        }
+                        Ok(None) => {
+                            error!("Host bus connection closed unexpectedly");
+                            return Err(crate::error::Error::ConnectionClosed("host bus".to_string()));
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Host bus connection failed");
+                            return Err(e);
+                        }
+                    }
                 }
 
                 // Handle messages from clients
@@ -409,12 +433,29 @@ impl Multiplexer {
 
     /// Handle a message from a client.
     async fn handle_client_message(&self, client_id: ClientId, msg: Message) {
-        trace!(
+        // Log all incoming client messages for debugging
+        let msg_type = if msg.is_method_call() {
+            "method_call"
+        } else if msg.is_signal() {
+            "signal"
+        } else if msg.is_method_return() {
+            "method_return"
+        } else if msg.is_error() {
+            "error"
+        } else {
+            "unknown"
+        };
+        
+        info!(
+            direction = "CLIENT->MUX",
             client_id = client_id,
+            msg_type = msg_type,
             serial = msg.serial(),
             destination = ?msg.destination_str(),
+            interface = ?msg.interface_str(),
             member = ?msg.member_str(),
-            "Processing client message"
+            path = ?msg.path_str(),
+            "Received message from client"
         );
 
         // Check if this is a D-Bus daemon method
@@ -1197,11 +1238,28 @@ impl Multiplexer {
 
     /// Handle a message from one of the buses.
     async fn handle_bus_message(&self, msg: Arc<Message>, route: Route) {
-        trace!(
+        // Log all incoming bus messages for debugging
+        let msg_type_str = if msg.is_method_call() {
+            "method_call"
+        } else if msg.is_signal() {
+            "signal"
+        } else if msg.is_method_return() {
+            "method_return"
+        } else if msg.is_error() {
+            "error"
+        } else {
+            "unknown"
+        };
+        
+        info!(
+            direction = "BUS->MUX",
             route = %route,
-            msg_type = ?msg.as_ref().primary_header().msg_type(),
+            msg_type = msg_type_str,
+            serial = msg.serial(),
             sender = ?msg.sender_str(),
             destination = ?msg.destination_str(),
+            interface = ?msg.interface_str(),
+            member = ?msg.member_str(),
             reply_serial = ?msg.reply_serial(),
             "Received message from bus"
         );
@@ -1228,26 +1286,53 @@ impl Multiplexer {
 
         // Handle replies
         if msg.is_method_return() || msg.is_error() {
-            if let Ok(Some((client_id, client_serial))) = self.router.handle_reply(&msg, route).await {
-                // Rewrite the reply_serial to match the client's original serial
-                let reply_msg = match clone_reply_with_serial(&msg, client_serial) {
-                    Ok(m) => Arc::new(m),
-                    Err(e) => {
+            let is_error = msg.is_error();
+            match self.router.handle_reply(&msg, route).await {
+                Ok(Some((client_id, client_serial))) => {
+                    // Rewrite the reply_serial to match the client's original serial
+                    let reply_msg = match clone_reply_with_serial(&msg, client_serial) {
+                        Ok(m) => Arc::new(m),
+                        Err(e) => {
+                            warn!(
+                                client_id = client_id,
+                                error = %e,
+                                "Failed to rewrite reply serial, forwarding original"
+                            );
+                            msg.clone()
+                        }
+                    };
+                    
+                    // Send reply to client
+                    let clients = self.clients.read().await;
+                    if let Some(info) = clients.get(&client_id) {
+                        info!(
+                            direction = "MUX->CLIENT",
+                            client_id = client_id,
+                            reply_type = if is_error { "error" } else { "method_return" },
+                            original_serial = client_serial,
+                            route = %route,
+                            "Sending reply to client"
+                        );
+                        if let Err(e) = info.tx.send(reply_msg).await {
+                            error!(client_id = client_id, error = %e, "Failed to send reply to client");
+                        }
+                    } else {
                         warn!(
                             client_id = client_id,
-                            error = %e,
-                            "Failed to rewrite reply serial, forwarding original"
+                            "Client disconnected before reply could be delivered"
                         );
-                        msg.clone()
                     }
-                };
-                
-                // Send reply to client
-                let clients = self.clients.read().await;
-                if let Some(info) = clients.get(&client_id) {
-                    if let Err(e) = info.tx.send(reply_msg).await {
-                        warn!(client_id = client_id, error = %e, "Failed to send reply to client");
-                    }
+                }
+                Ok(None) => {
+                    // Already logged in handle_reply
+                }
+                Err(e) => {
+                    error!(
+                        route = %route,
+                        error = %e,
+                        reply_serial = ?msg.reply_serial(),
+                        "Error handling reply from bus"
+                    );
                 }
             }
         }
@@ -1257,25 +1342,39 @@ impl Multiplexer {
             // Forward signals only to clients whose match rules match this signal
             let clients = self.clients.read().await;
             let mut forward_count = 0;
+            let mut forwarded_to: Vec<ClientId> = Vec::new();
             
             for (client_id, info) in clients.iter() {
                 // Check if any of the client's match rules match this signal
                 if info.match_rules.matches(&msg) {
                     if let Err(e) = info.tx.send(msg.clone()).await {
-                        trace!(client_id = client_id, error = %e, "Failed to send signal to client");
+                        warn!(client_id = client_id, error = %e, "Failed to send signal to client");
                     } else {
                         forward_count += 1;
+                        forwarded_to.push(*client_id);
                     }
                 }
             }
             
             if forward_count > 0 {
-                trace!(
+                info!(
+                    direction = "MUX->CLIENTS",
                     interface = ?msg.interface_str(),
                     member = ?msg.member_str(),
+                    sender = ?msg.sender_str(),
+                    path = ?msg.path_str(),
                     route = %route,
                     forward_count = forward_count,
+                    clients = ?forwarded_to,
                     "Forwarded signal to matching clients"
+                );
+            } else {
+                debug!(
+                    interface = ?msg.interface_str(),
+                    member = ?msg.member_str(),
+                    sender = ?msg.sender_str(),
+                    route = %route,
+                    "Signal received but no clients matched"
                 );
             }
         }
@@ -1296,14 +1395,18 @@ impl Multiplexer {
 
             match reply {
                 Ok(msg) => {
-                    trace!(
+                    info!(
+                        direction = "MUX->CLIENT",
                         client_id = client_id,
-                        serial = msg.serial(),
-                        reply_serial = msg.reply_serial(),
-                        "Sending reply to client"
+                        reply_type = "method_return",
+                        reply_to_serial = original_msg.serial(),
+                        interface = ?original_msg.interface_str(),
+                        member = ?original_msg.member_str(),
+                        generated_by = "mux",
+                        "Sending generated reply to client"
                     );
                     if let Err(e) = info.tx.send(Arc::new(msg)).await {
-                        warn!(client_id = client_id, error = %e, "Failed to send reply to client");
+                        error!(client_id = client_id, error = %e, "Failed to send reply to client");
                     }
                 }
                 Err(e) => {
@@ -1331,8 +1434,20 @@ impl Multiplexer {
 
             match error {
                 Ok(msg) => {
+                    info!(
+                        direction = "MUX->CLIENT",
+                        client_id = client_id,
+                        reply_type = "error",
+                        reply_to_serial = original_msg.serial(),
+                        error_name = error_name,
+                        error_message = message,
+                        interface = ?original_msg.interface_str(),
+                        member = ?original_msg.member_str(),
+                        generated_by = "mux",
+                        "Sending generated error to client"
+                    );
                     if let Err(e) = info.tx.send(Arc::new(msg)).await {
-                        warn!(client_id = client_id, error = %e, "Failed to send error to client");
+                        error!(client_id = client_id, error = %e, "Failed to send error to client");
                     }
                 }
                 Err(e) => {

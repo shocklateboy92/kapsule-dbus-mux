@@ -39,6 +39,10 @@ pub enum Error {
     /// The multiplexer was shut down.
     #[error("Multiplexer shut down")]
     Shutdown,
+
+    /// An upstream bus connection was unexpectedly closed.
+    #[error("Connection to {0} closed unexpectedly")]
+    ConnectionClosed(String),
 }
 
 /// Authentication-related errors.

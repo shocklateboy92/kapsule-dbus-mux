@@ -33,6 +33,9 @@ pub struct MatchRule {
     pub args: HashMap<u8, String>,
     /// Argument path filters (arg0path, arg1path, etc.).
     pub arg_paths: HashMap<u8, String>,
+    /// Argument namespace filters (arg0namespace only, per D-Bus spec).
+    /// Matches if arg0 is a bus name in this namespace.
+    pub arg0namespace: Option<String>,
     /// Eavesdrop flag (usually ignored for security).
     pub eavesdrop: bool,
 }
@@ -54,6 +57,7 @@ impl MatchRule {
             destination: None,
             args: HashMap::new(),
             arg_paths: HashMap::new(),
+            arg0namespace: None,
             eavesdrop: false,
         };
 
@@ -110,6 +114,7 @@ impl MatchRule {
                 "path_namespace" => result.path_namespace = Some(value),
                 "destination" => result.destination = Some(value),
                 "eavesdrop" => result.eavesdrop = value == "true",
+                "arg0namespace" => result.arg0namespace = Some(value),
                 key if key.starts_with("arg") && key.ends_with("path") => {
                     // argNpath
                     let num_str = &key[3..key.len() - 4];
@@ -214,7 +219,7 @@ impl MatchRule {
         }
 
         // Check argument filters
-        if !self.args.is_empty() || !self.arg_paths.is_empty() {
+        if !self.args.is_empty() || !self.arg_paths.is_empty() || self.arg0namespace.is_some() {
             // Try to deserialize body as tuple of strings
             // This is a simplified implementation - full implementation would
             // need to handle various D-Bus types
@@ -231,6 +236,18 @@ impl MatchRule {
                         Some(actual) => {
                             if actual != path_prefix && 
                                !actual.starts_with(&format!("{}/", path_prefix)) {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+
+                // Check arg0namespace: matches if arg0 equals the namespace or starts with "namespace."
+                if let Some(ref ns) = self.arg0namespace {
+                    match args.first() {
+                        Some(arg0) => {
+                            if arg0 != ns && !arg0.starts_with(&format!("{}.", ns)) {
                                 return false;
                             }
                         }

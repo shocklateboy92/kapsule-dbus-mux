@@ -211,16 +211,21 @@ impl BusConnection {
     }
 
     /// Receive the next message from this connection.
-    pub async fn recv(&self) -> Option<Arc<Message>> {
+    /// 
+    /// Returns:
+    /// - `Ok(Some(msg))` - A message was received successfully
+    /// - `Ok(None)` - The stream ended cleanly (connection closed)
+    /// - `Err(e)` - An error occurred (connection broken)
+    pub async fn recv(&self) -> Result<Option<Arc<Message>>> {
         use futures::StreamExt;
         let mut stream = self.stream.lock().await;
         match stream.next().await {
-            Some(Ok(msg)) => Some(Arc::new(msg)),
+            Some(Ok(msg)) => Ok(Some(Arc::new(msg))),
             Some(Err(e)) => {
-                tracing::error!(error = %e, "Error receiving message");
-                None
+                tracing::error!(bus = %self.name, error = %e, "Error receiving message from bus");
+                Err(e.into())
             }
-            None => None,
+            None => Ok(None),
         }
     }
 
