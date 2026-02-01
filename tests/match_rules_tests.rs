@@ -159,7 +159,12 @@ fn test_match_arg0() {
 
 #[test]
 fn test_match_arg0path() {
-    let rule = MatchRule::parse("type='signal',arg0path='/org/example'").unwrap();
+    // Per D-Bus spec: "there is also a match when either the string given in the 
+    // match rule or the appropriate message argument ends with '/' and is a prefix 
+    // of the other."
+    
+    // Test with trailing slash in filter (common case for monitoring directories)
+    let rule = MatchRule::parse("type='signal',arg0path='/org/example/'").unwrap();
     
     // Exact match
     let signal1 = create_test_signal_with_body(
@@ -167,11 +172,11 @@ fn test_match_arg0path() {
         "PathChanged",
         "/org/example",
         None,
-        &("/org/example",),
+        &("/org/example/",),
     );
-    assert!(rule.matches(&signal1));
+    assert!(rule.matches(&signal1), "Exact match should work");
     
-    // Child path
+    // Child path (filter ends with /, so it matches children)
     let signal2 = create_test_signal_with_body(
         "org.example",
         "PathChanged",
@@ -179,7 +184,7 @@ fn test_match_arg0path() {
         None,
         &("/org/example/child",),
     );
-    assert!(rule.matches(&signal2));
+    assert!(rule.matches(&signal2), "Filter with trailing / should match child paths");
     
     // Non-matching path
     let signal3 = create_test_signal_with_body(
@@ -189,7 +194,40 @@ fn test_match_arg0path() {
         None,
         &("/org/other",),
     );
-    assert!(!rule.matches(&signal3));
+    assert!(!rule.matches(&signal3), "Non-matching path should not match");
+    
+    // Test bidirectional matching: arg ends with '/', filter doesn't
+    let rule_no_slash = MatchRule::parse("type='signal',arg0path='/org/example'").unwrap();
+    
+    // Arg with trailing slash that is prefix of filter
+    let signal4 = create_test_signal_with_body(
+        "org.example",
+        "PathChanged",
+        "/org/example",
+        None,
+        &("/org/",),
+    );
+    assert!(rule_no_slash.matches(&signal4), "Arg ending with / should match if it's prefix of filter");
+    
+    // Root path with trailing slash
+    let signal5 = create_test_signal_with_body(
+        "org.example",
+        "PathChanged",
+        "/",
+        None,
+        &("/",),
+    );
+    assert!(rule_no_slash.matches(&signal5), "Root path / should match as prefix");
+    
+    // Neither ends with slash, not exact match - should NOT match
+    let signal6 = create_test_signal_with_body(
+        "org.example",
+        "PathChanged",
+        "/org/example",
+        None,
+        &("/org/example/child",),
+    );
+    assert!(!rule_no_slash.matches(&signal6), "Without trailing slash, child should not match");
 }
 
 #[test]

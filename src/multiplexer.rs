@@ -1088,6 +1088,15 @@ impl Multiplexer {
 
         debug!(client_id = client_id, rule = %rule_string, "AddMatch");
 
+        // Log portal Request match rules at INFO level for debugging
+        if rule_string.contains("portal.Request") || rule_string.contains("portal/desktop/request") {
+            info!(
+                client_id = client_id,
+                rule = %rule_string,
+                "Portal Request match rule"
+            );
+        }
+
         // Parse the match rule
         let rule = match MatchRule::parse(&rule_string) {
             Ok(r) => r,
@@ -1339,14 +1348,57 @@ impl Multiplexer {
 
         // Handle signals - filter by match rules
         if msg.is_signal() {
-            // Forward signals only to clients whose match rules match this signal
+            // Check if this signal is specifically addressed to the mux (unicast signal)
+            // This happens when services like xdg-desktop-portal send Response signals
+            // to the mux's unique name on the host bus.
+            let is_unicast_to_mux = match (msg.destination_str(), route) {
+                (Some(dest), Route::Host) => {
+                    self.host_conn.connection().unique_name()
+                        .map(|n| n.as_str() == dest)
+                        .unwrap_or(false)
+                }
+                (Some(dest), Route::Container) => {
+                    self.container_conn.connection().unique_name()
+                        .map(|n| n.as_str() == dest)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+
+            // Forward signals to clients whose match rules match this signal
             let clients = self.clients.read().await;
             let mut forward_count = 0;
             let mut forwarded_to: Vec<ClientId> = Vec::new();
             
+            // Log unicast signal details for debugging
+            if is_unicast_to_mux {
+                info!(
+                    interface = ?msg.interface_str(),
+                    member = ?msg.member_str(),
+                    path = ?msg.path_str(),
+                    destination = ?msg.destination_str(),
+                    num_clients = clients.len(),
+                    "Processing unicast signal to mux"
+                );
+            }
+            
             for (client_id, info) in clients.iter() {
-                // Check if any of the client's match rules match this signal
-                if info.match_rules.matches(&msg) {
+                // For unicast signals to the mux, use relaxed matching (ignore destination)
+                // because the client's match rule may have a different destination filter
+                let should_forward = if is_unicast_to_mux {
+                    let result = info.match_rules.matches_ignoring_destination(&msg);
+                    debug!(
+                        client_id = client_id,
+                        num_rules = info.match_rules.len(),
+                        result = result,
+                        "Checking unicast signal against client"
+                    );
+                    result
+                } else {
+                    info.match_rules.matches(&msg)
+                };
+                
+                if should_forward {
                     if let Err(e) = info.tx.send(msg.clone()).await {
                         warn!(client_id = client_id, error = %e, "Failed to send signal to client");
                     } else {
@@ -1364,6 +1416,7 @@ impl Multiplexer {
                     sender = ?msg.sender_str(),
                     path = ?msg.path_str(),
                     route = %route,
+                    is_unicast_to_mux = is_unicast_to_mux,
                     forward_count = forward_count,
                     clients = ?forwarded_to,
                     "Forwarded signal to matching clients"
@@ -1373,7 +1426,9 @@ impl Multiplexer {
                     interface = ?msg.interface_str(),
                     member = ?msg.member_str(),
                     sender = ?msg.sender_str(),
+                    destination = ?msg.destination_str(),
                     route = %route,
+                    is_unicast_to_mux = is_unicast_to_mux,
                     "Signal received but no clients matched"
                 );
             }

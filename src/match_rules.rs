@@ -220,9 +220,6 @@ impl MatchRule {
 
         // Check argument filters
         if !self.args.is_empty() || !self.arg_paths.is_empty() || self.arg0namespace.is_some() {
-            // Try to deserialize body as tuple of strings
-            // This is a simplified implementation - full implementation would
-            // need to handle various D-Bus types
             if let Ok(args) = self.extract_string_args(msg) {
                 for (idx, expected) in &self.args {
                     match args.get(*idx as usize) {
@@ -231,11 +228,10 @@ impl MatchRule {
                     }
                 }
                 
-                for (idx, path_prefix) in &self.arg_paths {
+                for (idx, path_filter) in &self.arg_paths {
                     match args.get(*idx as usize) {
                         Some(actual) => {
-                            if actual != path_prefix && 
-                               !actual.starts_with(&format!("{}/", path_prefix)) {
+                            if !matches_path_filter(actual, path_filter) {
                                 return false;
                             }
                         }
@@ -263,18 +259,166 @@ impl MatchRule {
         true
     }
 
+    /// Check if a message matches this rule, ignoring the destination filter.
+    /// 
+    /// This is used for unicast signals sent to the mux's unique name on upstream buses.
+    /// The mux forwards calls on behalf of clients, so signals addressed to the mux
+    /// should be delivered to clients based on other criteria (path, interface, etc.),
+    /// not the destination filter which would contain the mux's unique name.
+    pub fn matches_ignoring_destination(&self, msg: &Message) -> bool {
+        // Check message type
+        if let Some(ref type_filter) = self.msg_type {
+            let msg_type_str = match msg.primary_header().msg_type() {
+                zbus::message::Type::MethodCall => "method_call",
+                zbus::message::Type::MethodReturn => "method_return",
+                zbus::message::Type::Error => "error",
+                zbus::message::Type::Signal => "signal",
+            };
+            if type_filter != msg_type_str {
+                return false;
+            }
+        }
+
+        // Check sender
+        if let Some(ref sender_filter) = self.sender {
+            match msg.sender_str() {
+                Some(sender) if sender == *sender_filter => {}
+                Some(_) => return false,
+                None => return false,
+            }
+        }
+
+        // Check interface
+        if let Some(ref iface_filter) = self.interface {
+            match msg.interface_str() {
+                Some(iface) if iface == *iface_filter => {}
+                Some(_) => return false,
+                None => return false,
+            }
+        }
+
+        // Check member
+        if let Some(ref member_filter) = self.member {
+            match msg.member_str() {
+                Some(member) if member == *member_filter => {}
+                Some(_) => return false,
+                None => return false,
+            }
+        }
+
+        // Check path
+        if let Some(ref path_filter) = self.path {
+            match msg.path_str() {
+                Some(path) if path == *path_filter => {}
+                Some(_) => return false,
+                None => return false,
+            }
+        }
+
+        // Check path_namespace (matches path and all children)
+        if let Some(ref ns_filter) = self.path_namespace {
+            match msg.path_str() {
+                Some(path) => {
+                    if path != *ns_filter && !path.starts_with(&format!("{}/", ns_filter)) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        // NOTE: We intentionally skip the destination filter here.
+
+        // Check argument filters
+        if !self.args.is_empty() || !self.arg_paths.is_empty() || self.arg0namespace.is_some() {
+            if let Ok(args) = self.extract_string_args(msg) {
+                for (idx, expected) in &self.args {
+                    match args.get(*idx as usize) {
+                        Some(actual) if actual == expected => {}
+                        _ => return false,
+                    }
+                }
+                
+                for (idx, path_filter) in &self.arg_paths {
+                    match args.get(*idx as usize) {
+                        Some(actual) => {
+                            if !matches_path_filter(actual, path_filter) {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+
+                if let Some(ref ns) = self.arg0namespace {
+                    match args.first() {
+                        Some(arg0) => {
+                            if arg0 != ns && !arg0.starts_with(&format!("{}.", ns)) {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Extract string arguments from a message body.
+    /// 
+    /// This extracts arguments by position, returning the string value for each
+    /// position that contains a STRING or OBJECT_PATH type. Non-string arguments
+    /// are represented as empty strings in the returned vector.
     fn extract_string_args(&self, msg: &Message) -> Result<Vec<String>, ()> {
-        // Try to extract up to 10 string arguments
-        // This handles common cases like NameOwnerChanged(s, s, s)
+        use zbus::zvariant::Value;
+        
         let body = msg.body();
         
-        // Try as single string
+        // Get the max arg index we need to extract
+        let max_idx = self.args.keys()
+            .chain(self.arg_paths.keys())
+            .max()
+            .copied()
+            .unwrap_or(0);
+        
+        // Also check arg0namespace
+        let max_idx = if self.arg0namespace.is_some() {
+            max_idx.max(0)
+        } else {
+            max_idx
+        };
+        
+        let mut result = Vec::new();
+        
+        // Try to deserialize as a structure containing the arguments
+        // We use zvariant's Structure type to access arguments by position
+        if let Ok(structure) = body.deserialize::<zbus::zvariant::Structure>() {
+            for (idx, field) in structure.fields().iter().enumerate() {
+                if idx as u8 > max_idx {
+                    break;
+                }
+                // Extract string or object path values
+                let s = match field {
+                    Value::Str(s) => s.to_string(),
+                    Value::ObjectPath(p) => p.to_string(),
+                    _ => String::new(), // Non-string type, use empty placeholder
+                };
+                result.push(s);
+            }
+            return Ok(result);
+        }
+        
+        // Try common tuple patterns as fallback
+        // Single string
         if let Ok(s) = body.deserialize::<String>() {
             return Ok(vec![s]);
         }
         
-        // Try as tuple of strings
+        // Try as tuple of strings (common for NameOwnerChanged)
         if let Ok((s1, s2, s3)) = body.deserialize::<(String, String, String)>() {
             return Ok(vec![s1, s2, s3]);
         }
@@ -287,13 +431,41 @@ impl MatchRule {
             return Ok(vec![s1]);
         }
 
-        // Try as Vec<String>
-        if let Ok(v) = body.deserialize::<Vec<String>>() {
-            return Ok(v);
-        }
-
         Err(())
     }
+}
+
+/// Check if an argument value matches a path filter according to D-Bus argNpath rules.
+/// 
+/// Per the D-Bus specification:
+/// "As with normal argument matches, if the argument is exactly equal to the string
+/// given in the match rule then the rule is satisfied. Additionally, there is also
+/// a match when either the string given in the match rule or the appropriate message
+/// argument ends with '/' and is a prefix of the other."
+/// 
+/// Examples with arg0path='/aa/bb/':
+/// - '/' matches (arg ends with '/' and is prefix of filter)
+/// - '/aa/' matches (arg ends with '/' and is prefix of filter)  
+/// - '/aa/bb/' matches (exact)
+/// - '/aa/bb/cc/' matches (filter ends with '/' and is prefix of arg)
+/// - '/aa/bb/cc' matches (filter ends with '/' and is prefix of arg)
+fn matches_path_filter(arg_value: &str, filter: &str) -> bool {
+    // Exact match
+    if arg_value == filter {
+        return true;
+    }
+    
+    // If filter ends with '/', check if arg starts with filter
+    if filter.ends_with('/') && arg_value.starts_with(filter) {
+        return true;
+    }
+    
+    // If arg ends with '/', check if filter starts with arg
+    if arg_value.ends_with('/') && filter.starts_with(arg_value) {
+        return true;
+    }
+    
+    false
 }
 
 /// Errors that can occur when parsing match rules.
@@ -347,6 +519,12 @@ impl ClientMatchRules {
     /// Check if any rule matches the message.
     pub fn matches(&self, msg: &Message) -> bool {
         self.rules.iter().any(|r| r.matches(msg))
+    }
+
+    /// Check if any rule matches the message, ignoring destination filters.
+    /// Used for unicast signals addressed to the mux.
+    pub fn matches_ignoring_destination(&self, msg: &Message) -> bool {
+        self.rules.iter().any(|r| r.matches_ignoring_destination(msg))
     }
 
     /// Check if there are any rules.
