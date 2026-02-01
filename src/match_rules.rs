@@ -541,6 +541,26 @@ impl ClientMatchRules {
     pub fn rule_strings(&self) -> Vec<String> {
         self.rules.iter().map(|r| r.rule_string.clone()).collect()
     }
+
+    /// Get debug info about rules (path filters).
+    pub fn debug_rules(&self) -> Vec<String> {
+        self.rules.iter()
+            .filter_map(|r| {
+                // Include rules that might be relevant for portal Request signals
+                if r.interface.as_deref() == Some("org.freedesktop.portal.Request")
+                    || r.path.as_ref().map(|p| p.contains("portal")).unwrap_or(false)
+                    || r.path_namespace.as_ref().map(|p| p.contains("portal")).unwrap_or(false)
+                {
+                    Some(format!(
+                        "iface={:?} member={:?} path={:?} path_ns={:?} sender={:?}",
+                        r.interface, r.member, r.path, r.path_namespace, r.sender
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// Tracks reference counts for match rules on upstream buses.

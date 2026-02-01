@@ -1387,12 +1387,24 @@ impl Multiplexer {
                 // because the client's match rule may have a different destination filter
                 let should_forward = if is_unicast_to_mux {
                     let result = info.match_rules.matches_ignoring_destination(&msg);
-                    debug!(
-                        client_id = client_id,
-                        num_rules = info.match_rules.len(),
-                        result = result,
-                        "Checking unicast signal against client"
-                    );
+                    // Enhanced debug logging for portal signals
+                    if msg.interface_str().as_deref() == Some("org.freedesktop.portal.Request") {
+                        info!(
+                            client_id = client_id,
+                            num_rules = info.match_rules.len(),
+                            result = result,
+                            signal_path = ?msg.path_str(),
+                            rules = ?info.match_rules.debug_rules(),
+                            "Portal Request signal matching"
+                        );
+                    } else {
+                        debug!(
+                            client_id = client_id,
+                            num_rules = info.match_rules.len(),
+                            result = result,
+                            "Checking unicast signal against client"
+                        );
+                    }
                     result
                 } else {
                     info.match_rules.matches(&msg)
