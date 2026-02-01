@@ -12,6 +12,7 @@ pub mod error;
 pub mod match_rules;
 pub mod message;
 pub mod multiplexer;
+pub mod name_queue;
 pub mod router;
 pub mod routing;
 pub mod serial_map;

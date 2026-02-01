@@ -21,20 +21,13 @@ use crate::message::{
     clone_reply_with_serial, parse_name_owner_changed, ErrorBuilder, MessageExt, 
     MethodReturnBuilder, error_names,
 };
+use crate::name_queue::{
+    NameQueueManager,
+    request_name_reply,
+};
 use crate::router::MessageRouter;
 use crate::routing::{Route, RoutingTable};
 use crate::serial_map::ClientId;
-
-/// D-Bus request name reply codes.
-mod request_name_reply {
-    pub const PRIMARY_OWNER: u32 = 1;
-    pub const ALREADY_OWNER: u32 = 4;
-}
-
-/// D-Bus release name reply codes.
-mod release_name_reply {
-    pub const RELEASED: u32 = 1;
-}
 
 /// The D-Bus multiplexer.
 pub struct Multiplexer {
@@ -58,6 +51,8 @@ pub struct Multiplexer {
     client_msg_tx: mpsc::Sender<(ClientId, Message)>,
     /// Channel receiver for client messages.
     client_msg_rx: mpsc::Receiver<(ClientId, Message)>,
+    /// Name queue manager for tracking ownership queues.
+    name_queue: Arc<RwLock<NameQueueManager>>,
 }
 
 /// Information about a connected client.
@@ -150,6 +145,7 @@ impl Multiplexer {
             auth: SaslAuth::new(),
             client_msg_tx,
             client_msg_rx,
+            name_queue: Arc::new(RwLock::new(NameQueueManager::new())),
         })
     }
 
@@ -220,6 +216,7 @@ impl Multiplexer {
         let clients = self.clients.clone();
         let routing_table = self.routing_table.clone();
         let container_conn = self.container_conn.clone();
+        let name_queue = self.name_queue.clone();
 
         tokio::spawn(async move {
             match ClientHandler::accept(stream, &auth).await {
@@ -266,9 +263,63 @@ impl Multiplexer {
                         }
                     }
 
-                    // Release any names owned by this client from both
-                    // the routing table and the container bus
+                    // Remove client from name queues and handle ownership transfers
+                    let queue_results = {
+                        let mut queue = name_queue.write().await;
+                        queue.remove_client(client_id)
+                    };
+
+                    // Process ownership changes from queue
+                    for (name, new_owner) in queue_results {
+                        if let Some((new_owner_id, new_owner_name)) = new_owner {
+                            // A waiter was promoted - update routing
+                            let mut table = routing_table.write().await;
+                            table.on_container_name_change(&name, &unique_name, &new_owner_name);
+
+                            // Update owned_names for the new owner
+                            let mut clients_guard = clients.write().await;
+                            if let Some(info) = clients_guard.get_mut(&new_owner_id) {
+                                info.owned_names.insert(name.clone());
+                            }
+
+                            debug!(client_id = client_id, new_owner = new_owner_id, name = %name,
+                                   "Name ownership transferred on disconnect");
+                        } else {
+                            // No waiter - actually release from container bus
+                            {
+                                let mut table = routing_table.write().await;
+                                table.on_container_name_change(&name, &unique_name, "");
+                            }
+
+                            if let Err(e) = container_conn.connection()
+                                .call_method(
+                                    Some("org.freedesktop.DBus"),
+                                    "/org/freedesktop/DBus",
+                                    Some("org.freedesktop.DBus"),
+                                    "ReleaseName",
+                                    &(&name,),
+                                )
+                                .await
+                            {
+                                warn!(client_id = client_id, name = %name, error = %e,
+                                      "Failed to release name on client disconnect");
+                            } else {
+                                debug!(client_id = client_id, name = %name,
+                                       "Released name on client disconnect");
+                            }
+                        }
+                    }
+
+                    // Also release any names that were tracked in owned_names but not in the queue
+                    // (this handles edge cases where names were acquired before queue tracking)
                     for name in owned_names {
+                        // Skip if already handled by queue
+                        let queue = name_queue.read().await;
+                        if queue.name_has_owner(&name) {
+                            continue;
+                        }
+                        drop(queue);
+
                         // Update routing table
                         {
                             let mut table = routing_table.write().await;
@@ -443,31 +494,44 @@ impl Multiplexer {
 
         debug!(client_id = client_id, name = %name, flags = flags, "RequestName");
 
-        // Forward to container bus to actually acquire the name
-        let result = self.container_conn.connection()
-            .call_method(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                Some("org.freedesktop.DBus"),
-                "RequestName",
-                &(&name, flags),
-            )
-            .await;
+        // Get client's unique name
+        let unique_name = {
+            let clients = self.clients.read().await;
+            match clients.get(&client_id) {
+                Some(c) => c.unique_name.clone(),
+                None => {
+                    error!(client_id = client_id, "RequestName from unknown client");
+                    return;
+                }
+            }
+        };
 
-        match result {
-            Ok(reply) => {
-                let reply_code: u32 = reply.body().deserialize().unwrap_or(0);
+        // Process through our name queue manager
+        let queue_result = {
+            let mut queue = self.name_queue.write().await;
+            queue.request_name(&name, client_id, &unique_name, flags)
+        };
 
-                // Update routing table if successful
-                if reply_code == request_name_reply::PRIMARY_OWNER
-                    || reply_code == request_name_reply::ALREADY_OWNER
-                {
-                    let unique_name = {
-                        let clients = self.clients.read().await;
-                        clients.get(&client_id).map(|c| c.unique_name.clone())
-                    };
+        // If we became primary owner, forward to the actual container bus
+        if queue_result.forward_to_bus {
+            let result = self.container_conn.connection()
+                .call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "RequestName",
+                    &(&name, flags),
+                )
+                .await;
 
-                    if let Some(unique_name) = unique_name {
+            match result {
+                Ok(reply) => {
+                    let bus_reply_code: u32 = reply.body().deserialize().unwrap_or(0);
+
+                    // Update routing table if successful on the bus
+                    if bus_reply_code == request_name_reply::PRIMARY_OWNER
+                        || bus_reply_code == request_name_reply::ALREADY_OWNER
+                    {
                         let mut table = self.routing_table.write().await;
                         table.on_container_name_change(&name, "", &unique_name);
 
@@ -477,19 +541,27 @@ impl Multiplexer {
                             info.owned_names.insert(name.clone());
                         }
                     }
-                }
 
-                self.send_reply_to_client(client_id, msg, &reply_code).await;
+                    // Return the queue result code (not the bus code) to the client
+                    self.send_reply_to_client(client_id, msg, &queue_result.reply_code).await;
+                }
+                Err(e) => {
+                    // Bus call failed - revert queue state
+                    error!(client_id = client_id, error = %e, "RequestName failed on bus");
+                    let mut queue = self.name_queue.write().await;
+                    queue.release_name(&name, client_id);
+                    
+                    self.send_error_to_client(
+                        client_id,
+                        msg,
+                        error_names::FAILED,
+                        &format!("RequestName failed: {}", e),
+                    ).await;
+                }
             }
-            Err(e) => {
-                error!(client_id = client_id, error = %e, "RequestName failed");
-                self.send_error_to_client(
-                    client_id,
-                    msg,
-                    error_names::FAILED,
-                    &format!("RequestName failed: {}", e),
-                ).await;
-            }
+        } else {
+            // No bus call needed (queued, already owner, or rejected)
+            self.send_reply_to_client(client_id, msg, &queue_result.reply_code).await;
         }
     }
 
@@ -510,50 +582,74 @@ impl Multiplexer {
 
         debug!(client_id = client_id, name = %name, "ReleaseName");
 
-        // Forward to container bus
-        let result = self.container_conn.connection()
-            .call_method(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                Some("org.freedesktop.DBus"),
-                "ReleaseName",
-                &(&name,),
-            )
-            .await;
+        // Process through our name queue manager
+        let queue_result = {
+            let mut queue = self.name_queue.write().await;
+            queue.release_name(&name, client_id)
+        };
 
-        match result {
-            Ok(reply) => {
-                let reply_code: u32 = reply.body().deserialize().unwrap_or(0);
+        // Handle new owner promotion if a waiter was promoted
+        if let Some((new_owner_id, new_owner_name)) = queue_result.new_owner {
+            // The next waiter becomes primary owner - they need the name on the bus
+            // But first we need to release+reacquire on the container bus for them
+            // For simplicity, we'll keep the name on the bus but update routing
+            let mut table = self.routing_table.write().await;
+            table.on_container_name_change(&name, "", &new_owner_name);
 
-                if reply_code == release_name_reply::RELEASED {
-                    let unique_name = {
-                        let clients = self.clients.read().await;
-                        clients.get(&client_id).map(|c| c.unique_name.clone())
-                    };
+            // Update owned_names for the new owner
+            let mut clients = self.clients.write().await;
+            if let Some(info) = clients.get_mut(&client_id) {
+                info.owned_names.remove(&name);
+            }
+            if let Some(info) = clients.get_mut(&new_owner_id) {
+                info.owned_names.insert(name.clone());
+            }
 
+            debug!(client_id = client_id, new_owner = new_owner_id, name = %name, 
+                   "Name ownership transferred to queued waiter");
+        } else if queue_result.forward_to_bus {
+            // No waiters - actually release from container bus
+            let unique_name = {
+                let clients = self.clients.read().await;
+                clients.get(&client_id).map(|c| c.unique_name.clone())
+            };
+
+            let result = self.container_conn.connection()
+                .call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "ReleaseName",
+                    &(&name,),
+                )
+                .await;
+
+            match result {
+                Ok(_) => {
                     if let Some(unique_name) = unique_name {
                         let mut table = self.routing_table.write().await;
                         table.on_container_name_change(&name, &unique_name, "");
+                    }
 
-                        let mut clients = self.clients.write().await;
-                        if let Some(info) = clients.get_mut(&client_id) {
-                            info.owned_names.remove(&name);
-                        }
+                    let mut clients = self.clients.write().await;
+                    if let Some(info) = clients.get_mut(&client_id) {
+                        info.owned_names.remove(&name);
                     }
                 }
-
-                self.send_reply_to_client(client_id, msg, &reply_code).await;
+                Err(e) => {
+                    warn!(client_id = client_id, error = %e, name = %name,
+                          "ReleaseName failed on bus (name still released locally)");
+                }
             }
-            Err(e) => {
-                error!(client_id = client_id, error = %e, "ReleaseName failed");
-                self.send_error_to_client(
-                    client_id,
-                    msg,
-                    error_names::FAILED,
-                    &format!("ReleaseName failed: {}", e),
-                ).await;
+        } else {
+            // Client was in queue or didn't own the name - just update local tracking
+            let mut clients = self.clients.write().await;
+            if let Some(info) = clients.get_mut(&client_id) {
+                info.owned_names.remove(&name);
             }
         }
+
+        self.send_reply_to_client(client_id, msg, &queue_result.reply_code).await;
     }
 
     /// Handle the ListNames method.
@@ -794,15 +890,9 @@ impl Multiplexer {
             }
         };
 
-        // For now, just return empty list - we don't track queued owners
-        // The routing table only tracks which bus owns each name, not specific owners
-        let table = self.routing_table.read().await;
-        let owners: Vec<String> = if table.get_name_owner_route(&name).is_some() {
-            // Name exists but we don't track the actual owner string
-            vec![name.clone()]
-        } else {
-            Vec::new()
-        };
+        // Get the queue from our local name queue manager
+        let queue = self.name_queue.read().await;
+        let owners = queue.list_queued_owners(&name);
         
         self.send_reply_to_client(client_id, msg, &owners).await;
     }
